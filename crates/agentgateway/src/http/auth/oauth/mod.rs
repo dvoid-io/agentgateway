@@ -500,8 +500,8 @@ pub struct TokenSpec {
 pub struct ActorTokenSpec {
 	/// Where the actor token is read from in the incoming request. The CEL
 	/// `expression` source is permitted (extraction only). Unlike subject tokens,
-	/// actor tokens have no default source: exactly one of `source` or
-	/// `tokenRequest` must be set.
+	/// actor tokens have no default source: exactly one of `source`,
+	/// `tokenRequest` or `tokenRequests` must be set.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	source: Option<AuthorizationLocation>,
 	/// The gateway obtains the actor token itself, presenting its own identity to
@@ -510,6 +510,13 @@ pub struct ActorTokenSpec {
 	/// expires; when it cannot be obtained the exchange fails closed.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	token_request: Option<ActorTokenRequest>,
+	/// Like `tokenRequest`, with one actor per key: `key` is evaluated against the
+	/// incoming request (for example the caller's tenant claim) and picks the
+	/// request to use. Each actor's token is obtained and cached on its own. A
+	/// request whose key cannot be evaluated, or names no actor, is refused: it is
+	/// never exchanged with another key's actor.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	token_requests: Option<KeyedActorTokenRequests>,
 	/// RFC 8693 actor token type URN; when omitted defaults to access_token and is still sent
 	#[serde(default)]
 	#[cfg_attr(feature = "schema", schemars(with = "String"))]
@@ -521,15 +528,25 @@ pub struct ActorTokenSpec {
 
 impl ActorTokenSpec {
 	fn validate_load(&self) -> Result<(), String> {
-		match (&self.source, &self.token_request) {
-			(Some(_), Some(_)) => {
-				return Err("actor_token: set exactly one of source or tokenRequest, not both".into());
+		let set = [
+			self.source.is_some(),
+			self.token_request.is_some(),
+			self.token_requests.is_some(),
+		];
+		match set.iter().filter(|s| **s).count() {
+			0 => {
+				return Err("actor_token: one of source, tokenRequest or tokenRequests must be set".into());
 			},
-			(None, None) => {
-				return Err("actor_token: one of source or tokenRequest must be set".into());
+			1 => {},
+			_ => {
+				return Err("actor_token: set exactly one of source, tokenRequest or tokenRequests".into());
 			},
-			(None, Some(token_request)) => token_request.validate_load()?,
-			(Some(_), None) => {},
+		}
+		if let Some(token_request) = &self.token_request {
+			token_request.validate_load()?;
+		}
+		if let Some(keyed) = &self.token_requests {
+			keyed.validate_load()?;
 		}
 		if self.enforce_may_act && self.token_type != OAuthTokenType::Jwt {
 			return Err(format!(
@@ -661,6 +678,49 @@ impl ActorTokenRequest {
 	}
 }
 
+/// Actor token requests chosen per incoming request.
+#[apply(schema!)]
+pub struct KeyedActorTokenRequests {
+	/// CEL expression evaluated against the incoming request (the verified JWT is
+	/// `jwt`). It must evaluate to a string naming an entry in `requests`.
+	key: Arc<cel::Expression>,
+	/// The actor token request for each key. Each is obtained and cached
+	/// separately: one key's token is never used for another key's request.
+	requests: BTreeMap<String, ActorTokenRequest>,
+}
+
+impl KeyedActorTokenRequests {
+	fn validate_load(&self) -> Result<(), String> {
+		if self.requests.is_empty() {
+			return Err("actor_token.tokenRequests.requests must name at least one actor".into());
+		}
+		for (key, request) in &self.requests {
+			request
+				.validate_load()
+				.map_err(|e| format!("actor_token.tokenRequests.requests[{key:?}]: {e}"))?;
+		}
+		Ok(())
+	}
+
+	/// The actor for this request. Refused (never a fallback) when the key cannot
+	/// be evaluated to a string or names no actor.
+	fn select(&self, req: &Request) -> Result<&ActorTokenRequest, ProxyError> {
+		let exec = cel::Executor::new_request(req);
+		let key = exec
+			.eval(&self.key)
+			.ok()
+			.and_then(|value| value.as_str().ok().map(|k| k.into_owned()));
+		let Some(key) = key else {
+			debug!("oauth token exchange actor key did not evaluate to a string");
+			return Err(ProxyError::AuthorizationFailed);
+		};
+		self.requests.get(&key).ok_or_else(|| {
+			debug!(%key, "oauth token exchange has no actor for this key");
+			ProxyError::AuthorizationFailed
+		})
+	}
+}
+
 #[derive(Default)]
 #[apply(schema!)]
 struct TokenCacheConfig {
@@ -769,6 +829,7 @@ fn actor_token_from_proto(
 		// Local configuration only: a gateway-minted actor token holds the
 		// gateway's own credentials, which xDS does not carry.
 		token_request: None,
+		token_requests: None,
 		token_type: if spec.token_type.is_empty() {
 			OAuthTokenType::default()
 		} else {
@@ -884,7 +945,7 @@ pub(super) async fn apply_token_exchange(
 
 	let mut exchange = auth.build_exchange_request(req)?;
 	if let Some(spec) = &auth.actor_token
-		&& let Some(token_request) = &spec.token_request
+		&& let Some(token_request) = gateway_actor_request(spec, req)?
 	{
 		// Fails closed: without the gateway's own token there is no exchange.
 		let token = token_request.fetch(&client).await.map_err(|e| {
@@ -930,6 +991,19 @@ pub(super) fn extract_subject_token(
 		.extract(req)
 		.filter(|t| !t.trim().is_empty())
 		.map(Cow::into_owned)
+}
+
+/// The token request for the gateway's own actor, if the actor is the gateway's:
+/// the single `tokenRequest`, or the one `tokenRequests` selects for this request.
+fn gateway_actor_request<'a>(
+	spec: &'a ActorTokenSpec,
+	req: &Request,
+) -> Result<Option<&'a ActorTokenRequest>, ProxyError> {
+	match (&spec.token_request, &spec.token_requests) {
+		(Some(token_request), _) => Ok(Some(token_request)),
+		(None, Some(keyed)) => keyed.select(req).map(Some),
+		(None, None) => Ok(None),
+	}
 }
 
 /// `enforceMayAct` for an actor token the gateway obtained itself, the same
