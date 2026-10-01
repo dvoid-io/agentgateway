@@ -3961,7 +3961,7 @@
       "type": "object",
       "properties": {
         "source": {
-          "description": "Where the actor token is read from in the incoming request. The CEL\n`expression` source is permitted (extraction only). Unlike subject tokens,\nactor tokens have no default source: exactly one of `source` or\n`tokenRequest` must be set.",
+          "description": "Where the actor token is read from in the incoming request. The CEL\n`expression` source is permitted (extraction only). Unlike subject tokens,\nactor tokens have no default source: exactly one of `source`,\n`tokenRequest` or `tokenRequests` must be set.",
           "anyOf": [
             {
               "$ref": "#/$defs/AuthorizationLocation"
@@ -3976,6 +3976,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/ActorTokenRequest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tokenRequests": {
+          "description": "Like `tokenRequest`, with one actor per key: `key` is evaluated against the\nincoming request (for example the caller's tenant claim) and picks the\nrequest to use. Each actor's token is obtained and cached on its own. A\nrequest whose key cannot be evaluated, or names no actor, is refused: it is\nnever exchanged with another key's actor.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KeyedActorTokenRequests"
             },
             {
               "type": "null"
@@ -4278,6 +4289,28 @@
       "required": [
         "clientId",
         "clientSecret"
+      ]
+    },
+    "KeyedActorTokenRequests": {
+      "description": "Actor token requests chosen per incoming request.",
+      "type": "object",
+      "properties": {
+        "key": {
+          "description": "CEL expression evaluated against the incoming request (the verified JWT is\n`jwt`). It must evaluate to a string naming an entry in `requests`.",
+          "$ref": "#/$defs/Expression"
+        },
+        "requests": {
+          "description": "The actor token request for each key. Each is obtained and cached\nseparately: one key's token is never used for another key's request.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ActorTokenRequest"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "requests"
       ]
     },
     "TokenCacheConfig": {
