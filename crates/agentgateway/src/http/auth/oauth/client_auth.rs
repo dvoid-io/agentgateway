@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -11,6 +12,8 @@ use tracing::warn;
 
 use super::super::jws::{JwtSigningAlg, SigningKey, signing_alg_from_proto};
 use super::super::{jwt_claim_times, unix_timestamp_now};
+use super::transit::{RawVaultTransitSigner, VaultTransitSigner};
+use crate::proxy::httpproxy::PolicyClient;
 use crate::serdes::FileOrInline;
 use crate::types::proto::{ProtoError, agent as proto};
 use crate::{apply, schema_enum, ser_redact};
@@ -115,10 +118,20 @@ enum RawOAuthClientAuth {
 	PrivateKeyJwt {
 		/// `client_id` parameter identifying the gateway at the authorization server.
 		client_id: String,
-		/// PEM-encoded private signing key (RSA or EC, matching `alg`).
-		#[cfg_attr(feature = "schema", schemars(with = "crate::serdes::FileOrInline"))]
-		#[serde(deserialize_with = "crate::serdes::deser_key_from_file")]
-		signing_key: SecretString,
+		/// PEM-encoded private signing key (RSA or EC, matching `alg`). Exactly one
+		/// of `signingKey` or `signer` must be set.
+		#[cfg_attr(
+			feature = "schema",
+			schemars(with = "Option<crate::serdes::FileOrInline>")
+		)]
+		#[serde(
+			default,
+			deserialize_with = "crate::serdes::deser_key_from_file_option"
+		)]
+		signing_key: Option<SecretString>,
+		/// An external signer holds the key instead; the gateway never sees it.
+		#[serde(default)]
+		signer: Option<RawSigner>,
 		/// PEM-encoded X.509 certificate chain, leaf first. The leaf public key must
 		/// correspond to `signing_key` for token endpoints to validate assertions.
 		/// A mismatch or comparison failure is logged and does not prevent loading.
@@ -178,6 +191,7 @@ impl TryFrom<RawOAuthClientAuthConfig> for OAuthClientAuth {
 			RawOAuthClientAuthConfig::Tagged(RawOAuthClientAuth::PrivateKeyJwt {
 				client_id,
 				signing_key,
+				signer,
 				certificate,
 				certificate_header,
 				alg,
@@ -186,6 +200,7 @@ impl TryFrom<RawOAuthClientAuthConfig> for OAuthClientAuth {
 			}) => {
 				let private_key_jwt = PrivateKeyJwt::try_from(RawPrivateKeyJwt {
 					signing_key,
+					signer,
 					certificate,
 					certificate_header,
 					alg,
@@ -230,7 +245,7 @@ pub enum OAuthClientAuthMethod {
 pub struct PrivateKeyJwt {
 	#[serde(skip)]
 	#[cfg_attr(feature = "schema", schemars(skip))]
-	signing_key: SigningKey,
+	key: AssertionKey,
 	#[serde(default)]
 	alg: JwtSigningAlg,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -245,7 +260,7 @@ pub struct PrivateKeyJwt {
 impl fmt::Debug for PrivateKeyJwt {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("PrivateKeyJwt")
-			.field("signing_key", &"[REDACTED]")
+			.field("key", &self.key)
 			.field("alg", &self.alg)
 			.field("kid", &self.kid)
 			.field("x5c", &self.x5c.as_ref().map(|_| "[REDACTED]"))
@@ -259,10 +274,20 @@ impl fmt::Debug for PrivateKeyJwt {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub(super) struct RawPrivateKeyJwt {
-	/// PEM-encoded private signing key (RSA or EC, matching `alg`).
-	#[cfg_attr(feature = "schema", schemars(with = "crate::serdes::FileOrInline"))]
-	#[serde(deserialize_with = "crate::serdes::deser_key_from_file")]
-	pub(super) signing_key: SecretString,
+	/// PEM-encoded private signing key (RSA or EC, matching `alg`). Exactly one
+	/// of `signingKey` or `signer` must be set.
+	#[cfg_attr(
+		feature = "schema",
+		schemars(with = "Option<crate::serdes::FileOrInline>")
+	)]
+	#[serde(
+		default,
+		deserialize_with = "crate::serdes::deser_key_from_file_option"
+	)]
+	pub(super) signing_key: Option<SecretString>,
+	/// An external signer holds the key instead; the gateway never sees it.
+	#[serde(default)]
+	pub(super) signer: Option<RawSigner>,
 	/// PEM-encoded X.509 certificate chain, leaf first. The leaf public key must
 	/// correspond to `signing_key` for token endpoints to validate assertions.
 	/// A mismatch or comparison failure is logged and does not prevent loading.
@@ -287,8 +312,35 @@ impl TryFrom<RawPrivateKeyJwt> for PrivateKeyJwt {
 		if raw.assertion_audience.is_empty() {
 			return Err("oauth private_key_jwt assertion_audience must not be empty".into());
 		}
+		let signing_key_pem = match (raw.signing_key, raw.signer) {
+			(Some(_), Some(_)) => {
+				return Err(
+					"oauth private_key_jwt: set exactly one of signing_key or signer, not both".into(),
+				);
+			},
+			(None, None) => {
+				return Err("oauth private_key_jwt: one of signing_key or signer must be set".into());
+			},
+			(None, Some(signer)) => {
+				if raw.alg != JwtSigningAlg::Rs256 {
+					return Err("oauth private_key_jwt signer supports alg RS256 only".into());
+				}
+				if raw.certificate.is_some() || raw.certificate_header.is_some() {
+					return Err("oauth private_key_jwt signer does not support certificate headers".into());
+				}
+				return Ok(Self {
+					key: AssertionKey::VaultTransit(Arc::new(signer.vault_transit.try_into()?)),
+					alg: raw.alg,
+					kid: raw.kid,
+					x5c: None,
+					x5t_s256: None,
+					assertion_audience: raw.assertion_audience,
+				});
+			},
+			(Some(pem), None) => pem,
+		};
 		// TODO: file-based keys are loaded once at config load; consider reload/rotation (K8s secret remounts need a restart)
-		let signing_key_pem = raw.signing_key.expose_secret();
+		let signing_key_pem = signing_key_pem.expose_secret();
 		let signing_key = SigningKey::from_pem(raw.alg, signing_key_pem.trim().as_bytes())
 			.map_err(|e| format!("failed to parse oauth private_key_jwt signing_key: {e}"))?;
 		let certificate_headers = match (raw.certificate, raw.certificate_header) {
@@ -308,7 +360,7 @@ impl TryFrom<RawPrivateKeyJwt> for PrivateKeyJwt {
 			(None, None) => CertificateHeaders::default(),
 		};
 		Ok(Self {
-			signing_key,
+			key: AssertionKey::Local(signing_key),
 			alg: raw.alg,
 			kid: raw.kid,
 			x5c: certificate_headers.x5c,
@@ -505,7 +557,9 @@ impl TryFrom<proto::o_auth_client_auth::PrivateKeyJwt> for PrivateKeyJwt {
 		private_key_jwt: proto::o_auth_client_auth::PrivateKeyJwt,
 	) -> Result<Self, Self::Error> {
 		Self::try_from(RawPrivateKeyJwt {
-			signing_key: SecretString::from(private_key_jwt.signing_key),
+			signing_key: Some(SecretString::from(private_key_jwt.signing_key)),
+			// An external signer is local configuration only.
+			signer: None,
 			certificate: (!private_key_jwt.certificate.is_empty())
 				.then_some(FileOrInline::Inline(private_key_jwt.certificate).into()),
 			certificate_header: certificate_header_from_proto(private_key_jwt.certificate_header)?,
@@ -541,21 +595,88 @@ fn certificate_header_from_proto(header: i32) -> Result<Option<CertificateHeader
 	}
 }
 
-pub(super) fn sign_client_assertion(
+/// Where the assertion's private key lives.
+#[derive(Clone)]
+enum AssertionKey {
+	/// In the gateway's configuration.
+	Local(SigningKey),
+	/// In an OpenBao / Vault transit engine; the gateway never holds it.
+	VaultTransit(Arc<VaultTransitSigner>),
+}
+
+impl fmt::Debug for AssertionKey {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Local(_) => f.write_str("[REDACTED]"),
+			Self::VaultTransit(signer) => signer.fmt(f),
+		}
+	}
+}
+
+/// `signer`: the key is held outside the gateway.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub(super) struct RawSigner {
+	/// An OpenBao / HashiCorp Vault transit key.
+	vault_transit: RawVaultTransitSigner,
+}
+
+impl PrivateKeyJwt {
+	/// Whether the key is held by an external signer rather than the gateway.
+	pub(super) fn is_external(&self) -> bool {
+		matches!(self.key, AssertionKey::VaultTransit(_))
+	}
+}
+
+pub(super) async fn sign_client_assertion(
+	client: &PolicyClient,
 	client_id: &str,
 	private_key: &PrivateKeyJwt,
 ) -> anyhow::Result<String> {
-	#[derive(serde::Serialize)]
-	struct ClientAssertionClaims<'a> {
-		iss: &'a str,
-		sub: &'a str,
-		aud: &'a str,
-		jti: String,
-		nbf: u64,
-		iat: u64,
-		exp: u64,
+	match &private_key.key {
+		AssertionKey::Local(signing_key) => {
+			let (header, claims) = client_assertion_parts(client_id, private_key)?;
+			signing_key
+				.encode(&header, &claims)
+				.context("failed to sign client assertion")
+		},
+		AssertionKey::VaultTransit(signer) => {
+			// The JWS compact form, signed by the engine: the same header and
+			// claims, base64url JSON, as a local key would sign. Only the signing
+			// input is held across the call, and the call is boxed: a remote
+			// signature is a cache-miss path and stays off the request future.
+			let input = {
+				let (header, claims) = client_assertion_parts(client_id, private_key)?;
+				format!(
+					"{}.{}",
+					URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header)?),
+					URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?),
+				)
+			};
+			let signature = Box::pin(signer.sign(client, input.as_bytes()))
+				.await
+				.context("failed to sign client assertion with the transit key")?;
+			Ok(format!("{input}.{signature}"))
+		},
 	}
+}
 
+#[derive(serde::Serialize)]
+struct ClientAssertionClaims<'a> {
+	iss: &'a str,
+	sub: &'a str,
+	aud: &'a str,
+	jti: String,
+	nbf: u64,
+	iat: u64,
+	exp: u64,
+}
+
+fn client_assertion_parts<'a>(
+	client_id: &'a str,
+	private_key: &'a PrivateKeyJwt,
+) -> anyhow::Result<(jsonwebtoken::Header, ClientAssertionClaims<'a>)> {
 	let now = unix_timestamp_now()?;
 	let times = jwt_claim_times(now, CLIENT_ASSERTION_LIFETIME, CLIENT_ASSERTION_CLOCK_SKEW)?;
 	let claims = ClientAssertionClaims {
@@ -567,12 +688,8 @@ pub(super) fn sign_client_assertion(
 		iat: times.issued_at,
 		exp: times.expires_at,
 	};
-
 	let mut header = private_key.alg.header(private_key.kid.clone());
 	header.x5c = private_key.x5c.clone();
 	header.x5t_s256 = private_key.x5t_s256.clone();
-	private_key
-		.signing_key
-		.encode(&header, &claims)
-		.context("failed to sign client assertion")
+	Ok((header, claims))
 }

@@ -709,7 +709,8 @@ async fn id_jag_chained_exchange_client_error_is_upstream_failure() {
 async fn private_key_jwt_sends_client_assertion_form_fields() {
 	let mock = mock_token_endpoint(ResponseTemplate::new(200).set_body_json(token_body())).await;
 	let private_key = PrivateKeyJwt::try_from(RawPrivateKeyJwt {
-		signing_key: SecretString::from(TEST_EC_PRIVATE_KEY_PEM),
+		signing_key: Some(SecretString::from(TEST_EC_PRIVATE_KEY_PEM)),
+		signer: None,
 		certificate: Some(FileOrInline::Inline(TEST_EC_CERT_PEM.to_string()).into()),
 		certificate_header: Some(CertificateHeader::X5c),
 		alg: JwtSigningAlg::Es256,
@@ -766,7 +767,8 @@ async fn private_key_jwt_sends_client_assertion_form_fields() {
 #[test]
 fn private_key_jwt_debug_redacts_key_and_certificate() {
 	let raw = RawPrivateKeyJwt {
-		signing_key: SecretString::from(TEST_EC_PRIVATE_KEY_PEM),
+		signing_key: Some(SecretString::from(TEST_EC_PRIVATE_KEY_PEM)),
+		signer: None,
 		certificate: Some(FileOrInline::Inline(TEST_EC_CERT_PEM.to_string()).into()),
 		certificate_header: Some(CertificateHeader::X5c),
 		alg: JwtSigningAlg::Es256,
@@ -786,8 +788,8 @@ fn private_key_jwt_debug_redacts_key_and_certificate() {
 	assert!(debug.contains("alg: Es256"));
 }
 
-#[test]
-fn private_key_jwt_sets_x5t_s256_header() {
+#[tokio::test]
+async fn private_key_jwt_sets_x5t_s256_header() {
 	let private_key = serde_json::from_value::<PrivateKeyJwt>(json!({
 		"signingKey": TEST_EC_PRIVATE_KEY_PEM,
 		"certificate": TEST_EC_CERT_PEM,
@@ -797,7 +799,9 @@ fn private_key_jwt_sets_x5t_s256_header() {
 	}))
 	.unwrap();
 
-	let assertion = sign_client_assertion("gateway-client", &private_key).unwrap();
+	let assertion = sign_client_assertion(&policy_client(), "gateway-client", &private_key)
+		.await
+		.unwrap();
 	let header = jsonwebtoken::decode_header(&assertion).unwrap();
 	assert_eq!(header.x5c, None);
 	assert_eq!(
@@ -806,12 +810,13 @@ fn private_key_jwt_sets_x5t_s256_header() {
 	);
 }
 
-#[test]
-fn private_key_jwt_signs_with_ps256() {
+#[tokio::test]
+async fn private_key_jwt_signs_with_ps256() {
 	let signing_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
 	let public_key = signing_key.public_key_pem();
 	let private_key = PrivateKeyJwt::try_from(RawPrivateKeyJwt {
-		signing_key: SecretString::from(signing_key.serialize_pem()),
+		signing_key: Some(SecretString::from(signing_key.serialize_pem())),
+		signer: None,
 		certificate: None,
 		certificate_header: None,
 		alg: JwtSigningAlg::Ps256,
@@ -820,7 +825,9 @@ fn private_key_jwt_signs_with_ps256() {
 	})
 	.unwrap();
 
-	let assertion = sign_client_assertion("gateway-client", &private_key).unwrap();
+	let assertion = sign_client_assertion(&policy_client(), "gateway-client", &private_key)
+		.await
+		.unwrap();
 	assert_eq!(
 		jsonwebtoken::decode_header(&assertion).unwrap().alg,
 		jsonwebtoken::Algorithm::PS256
@@ -845,7 +852,8 @@ fn private_key_jwt_requires_certificate_and_header_together(
 	#[case] expected: &str,
 ) {
 	let err = PrivateKeyJwt::try_from(RawPrivateKeyJwt {
-		signing_key: SecretString::from(TEST_EC_PRIVATE_KEY_PEM),
+		signing_key: Some(SecretString::from(TEST_EC_PRIVATE_KEY_PEM)),
+		signer: None,
 		certificate: with_certificate
 			.then(|| FileOrInline::Inline(TEST_EC_CERT_PEM.to_string()))
 			.map(Into::into),
@@ -905,7 +913,8 @@ fn private_key_jwt_rejects_non_certificate_pem_at_deserialize_time() {
 #[test]
 fn private_key_jwt_rejects_invalid_certificate_in_chain() {
 	let err = PrivateKeyJwt::try_from(RawPrivateKeyJwt {
-		signing_key: SecretString::from(TEST_EC_PRIVATE_KEY_PEM),
+		signing_key: Some(SecretString::from(TEST_EC_PRIVATE_KEY_PEM)),
+		signer: None,
 		certificate: Some(
 			FileOrInline::Inline(format!("{TEST_EC_CERT_PEM}{TEST_INVALID_CERT_PEM}")).into(),
 		),
@@ -924,7 +933,8 @@ fn private_key_jwt_rejects_invalid_certificate_in_chain() {
 #[test]
 fn private_key_jwt_warns_but_accepts_mismatched_certificate() {
 	PrivateKeyJwt::try_from(RawPrivateKeyJwt {
-		signing_key: SecretString::from(TEST_EC_PRIVATE_KEY_PEM),
+		signing_key: Some(SecretString::from(TEST_EC_PRIVATE_KEY_PEM)),
+		signer: None,
 		certificate: Some(FileOrInline::Inline(TEST_MISMATCHED_CERT_PEM.to_string()).into()),
 		certificate_header: Some(CertificateHeader::X5c),
 		alg: JwtSigningAlg::Es256,
@@ -1918,7 +1928,8 @@ fn private_key_jwt_client_auth_from_proto() {
 #[test]
 fn private_key_jwt_serialization_omits_unset_optional_headers() {
 	let private_key = PrivateKeyJwt::try_from(RawPrivateKeyJwt {
-		signing_key: SecretString::from(TEST_EC_PRIVATE_KEY_PEM),
+		signing_key: Some(SecretString::from(TEST_EC_PRIVATE_KEY_PEM)),
+		signer: None,
 		certificate: None,
 		certificate_header: None,
 		alg: JwtSigningAlg::Es256,
@@ -2582,7 +2593,8 @@ const GATEWAY_ACTOR_TOKEN: &str = "gateway-actor-token";
 
 fn gateway_private_key_jwt() -> PrivateKeyJwt {
 	PrivateKeyJwt::try_from(RawPrivateKeyJwt {
-		signing_key: SecretString::from(TEST_EC_PRIVATE_KEY_PEM),
+		signing_key: Some(SecretString::from(TEST_EC_PRIVATE_KEY_PEM)),
+		signer: None,
 		certificate: None,
 		certificate_header: None,
 		alg: JwtSigningAlg::Es256,
@@ -3233,4 +3245,722 @@ fn actor_per_org_deserializes_from_local_config() {
 		vec!["org-a", "org-b"]
 	);
 	assert_eq!(keyed.requests["org-b"].client_auth.client_id, "actor-b");
+}
+
+// ----- assertions signed by an OpenBao / Vault transit key (signer.vaultTransit) -----
+
+struct TransitKey {
+	encoding: jsonwebtoken::EncodingKey,
+	public_pem: String,
+}
+
+fn transit_key() -> TransitKey {
+	let pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
+	TransitKey {
+		encoding: jsonwebtoken::EncodingKey::from_rsa_pem(pair.serialize_pem().as_bytes()).unwrap(),
+		public_pem: pair.public_key_pem(),
+	}
+}
+
+static ACTOR_KEY: std::sync::LazyLock<TransitKey> = std::sync::LazyLock::new(transit_key);
+static OTHER_KEY: std::sync::LazyLock<TransitKey> = std::sync::LazyLock::new(transit_key);
+
+/// `POST {mount}/sign/{key}` as the engine answers it: an RSASSA-PKCS1-v1_5 SHA-256
+/// signature over the base64 `input`, as `vault:v1:<base64>`.
+struct TransitSign(&'static TransitKey);
+
+impl wiremock::Respond for TransitSign {
+	fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+		let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+		let input = BASE64_STANDARD
+			.decode(body["input"].as_str().unwrap())
+			.unwrap();
+		let signature =
+			jsonwebtoken::crypto::sign(&input, &self.0.encoding, jsonwebtoken::Algorithm::RS256).unwrap();
+		let raw = BASE64_URL_SAFE_NO_PAD.decode(signature).unwrap();
+		ResponseTemplate::new(200).set_body_json(json!({
+			"data": {"signature": format!("vault:v1:{}", BASE64_STANDARD.encode(raw))}
+		}))
+	}
+}
+
+fn engine_login_ok(token: &str, lease: u64) -> ResponseTemplate {
+	ResponseTemplate::new(200)
+		.set_body_json(json!({"auth": {"client_token": token, "lease_duration": lease}}))
+}
+
+/// The engine: a namespaced JWT login and the named keys' sign endpoints.
+async fn mock_engine(
+	login: ResponseTemplate,
+	logins: u64,
+	keys: &[(&str, &'static TransitKey)],
+) -> MockServer {
+	let engine = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/v1/auth/jwt/login"))
+		.and(wiremock::matchers::header("x-vault-namespace", "platform"))
+		.respond_with(login)
+		.expect(logins)
+		.mount(&engine)
+		.await;
+	for (name, key) in keys {
+		Mock::given(method("POST"))
+			.and(path(format!("/v1/transit/sign/{name}")))
+			.and(wiremock::matchers::header("x-vault-namespace", "platform"))
+			.and(wiremock::matchers::header_exists("x-vault-token"))
+			.respond_with(TransitSign(key))
+			.mount(&engine)
+			.await;
+	}
+	engine
+}
+
+/// The IdP: `/self` (the gateway's own token, for the engine login), `/actor`, `/token`.
+async fn mock_idp(self_token: ResponseTemplate) -> MockServer {
+	let idp = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/self"))
+		.respond_with(self_token)
+		.mount(&idp)
+		.await;
+	Mock::given(method("POST"))
+		.and(path("/actor"))
+		.respond_with(
+			ResponseTemplate::new(200).set_body_json(actor_token_body(GATEWAY_ACTOR_TOKEN, 3600)),
+		)
+		.mount(&idp)
+		.await;
+	Mock::given(method("POST"))
+		.and(path("/token"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(token_body()))
+		.mount(&idp)
+		.await;
+	idp
+}
+
+fn self_token_ok() -> ResponseTemplate {
+	ResponseTemplate::new(200).set_body_json(actor_token_body("gateway-self-token", 3600))
+}
+
+fn transit_signer(engine: &MockServer, idp: &MockServer, key: &str) -> serde_json::Value {
+	json!({"vaultTransit": {
+		"address": format!("http://{}", engine.address()),
+		"namespace": "platform",
+		"key": key,
+		"keyVersion": 1,
+		"auth": {"jwt": {
+			"role": "agentgateway",
+			"tokenRequest": {
+				"host": idp.address().to_string(),
+				"path": "/self",
+				"grantType": "jwtBearer",
+				"clientAuth": {
+					"method": "privateKeyJwt",
+					"clientId": "gateway-user",
+					"signingKey": TEST_EC_PRIVATE_KEY_PEM,
+					"alg": "ES256",
+					"assertionAudience": "https://issuer.example",
+				},
+				"scopes": ["openid"],
+			},
+		}},
+	}})
+}
+
+fn transit_client_auth(signer: serde_json::Value, client_id: &str, kid: &str) -> OAuthClientAuth {
+	serde_json::from_value(json!({
+		"method": "privateKeyJwt",
+		"clientId": client_id,
+		"kid": kid,
+		"assertionAudience": "https://issuer.example",
+		"signer": signer,
+	}))
+	.unwrap()
+}
+
+fn transit_actor(idp: &MockServer, client_auth: OAuthClientAuth) -> ActorTokenRequest {
+	ActorTokenRequest {
+		client_auth,
+		..actor_token_request(
+			endpoint(idp),
+			ActorTokenGrant::JwtBearer,
+			gateway_client_secret(),
+		)
+	}
+}
+
+fn gateway_client_secret() -> OAuthClientAuth {
+	OAuthClientAuth {
+		client_id: "unused".into(),
+		method: OAuthClientAuthMethod::ClientSecretBasic {
+			client_secret: "unused".to_string().into(),
+		},
+	}
+}
+
+/// Verify an RS256 assertion with a transit key's PUBLIC key: issuer, subject, audience.
+fn verify_assertion(assertion: &str, key: &TransitKey, client_id: &str) -> Result<(), String> {
+	let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+	validation.set_audience(&["https://issuer.example"]);
+	validation.set_issuer(&[client_id]);
+	validation.sub = Some(client_id.to_string());
+	jsonwebtoken::decode::<serde_json::Value>(
+		assertion,
+		&jsonwebtoken::DecodingKey::from_rsa_pem(key.public_pem.as_bytes()).unwrap(),
+		&validation,
+	)
+	.map(|_| ())
+	.map_err(|e| e.to_string())
+}
+
+async fn bodies_sent_to(server: &MockServer, to: &str) -> Vec<serde_json::Value> {
+	server
+		.received_requests()
+		.await
+		.unwrap()
+		.iter()
+		.filter(|r| r.url.path() == to)
+		.map(|r| serde_json::from_slice(&r.body).unwrap())
+		.collect()
+}
+
+#[tokio::test]
+async fn transit_signer_signs_the_actor_assertion_with_its_named_key() {
+	let engine = mock_engine(
+		engine_login_ok("engine-token-1", 600),
+		1,
+		&[("actor-notarik", &ACTOR_KEY), ("app", &OTHER_KEY)],
+	)
+	.await;
+	let idp = mock_idp(self_token_ok()).await;
+	let actor = transit_actor(
+		&idp,
+		transit_client_auth(
+			transit_signer(&engine, &idp, "actor-notarik"),
+			"actor-notarik-user",
+			"actor-notarik-kid",
+		),
+	);
+	let a = OAuthTokenExchangeAuth {
+		actor_token: Some(gateway_actor(actor, OAuthTokenType::AccessToken)),
+		..auth(endpoint(&idp))
+	};
+
+	crate::http::auth::apply_backend_auth(
+		&backend_info(),
+		&backend_auth(a),
+		&mut request_with_subject("subj"),
+	)
+	.await
+	.unwrap();
+
+	// The engine login: the gateway's own token, the role, in the namespace.
+	let login = &bodies_sent_to(&engine, "/v1/auth/jwt/login").await[0];
+	assert_eq!(login["role"], "agentgateway");
+	assert_eq!(login["jwt"], "gateway-self-token");
+	// The sign call: the named key, the declared algorithms, the base64 signing input.
+	let sign = &bodies_sent_to(&engine, "/v1/transit/sign/actor-notarik").await[0];
+	assert_eq!(sign["hash_algorithm"], "sha2-256");
+	assert_eq!(sign["signature_algorithm"], "pkcs1v15");
+	assert_eq!(sign["prehashed"], false);
+	assert!(
+		bodies_sent_to(&engine, "/v1/transit/sign/app")
+			.await
+			.is_empty()
+	);
+	let sign_req = engine
+		.received_requests()
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|r| r.url.path() == "/v1/transit/sign/actor-notarik")
+		.unwrap();
+	assert_eq!(
+		sign_req.headers.get("x-vault-token").unwrap(),
+		"engine-token-1"
+	);
+
+	// The actor assertion verifies with the transit key's public key, and only that key.
+	let assertion = forms_sent_to(&idp, "/actor").await[0]["assertion"].clone();
+	let (signing_input, _) = assertion.rsplit_once('.').unwrap();
+	assert_eq!(
+		BASE64_STANDARD
+			.decode(sign["input"].as_str().unwrap())
+			.unwrap(),
+		signing_input.as_bytes()
+	);
+	verify_assertion(&assertion, &ACTOR_KEY, "actor-notarik-user").unwrap();
+	assert!(verify_assertion(&assertion, &OTHER_KEY, "actor-notarik-user").is_err());
+	let header = jsonwebtoken::decode_header(&assertion).unwrap();
+	assert_eq!(header.alg, jsonwebtoken::Algorithm::RS256);
+	assert_eq!(header.kid.as_deref(), Some("actor-notarik-kid"));
+	assert_eq!(
+		forms_sent_to(&idp, "/token").await[0]["actor_token"],
+		GATEWAY_ACTOR_TOKEN
+	);
+}
+
+#[tokio::test]
+async fn transit_signer_signs_the_exchanging_apps_client_assertion() {
+	let engine = mock_engine(
+		engine_login_ok("engine-token-1", 600),
+		1,
+		&[("app", &OTHER_KEY)],
+	)
+	.await;
+	let idp = mock_idp(self_token_ok()).await;
+	let a = OAuthTokenExchangeAuth {
+		client_auth: Some(transit_client_auth(
+			transit_signer(&engine, &idp, "app"),
+			"app-client",
+			"app-kid",
+		)),
+		..auth(endpoint(&idp))
+	};
+
+	crate::http::auth::apply_backend_auth(
+		&backend_info(),
+		&backend_auth(a),
+		&mut request_with_subject("subj"),
+	)
+	.await
+	.unwrap();
+
+	let exchange = &forms_sent_to(&idp, "/token").await[0];
+	assert_eq!(exchange["client_id"], "app-client");
+	assert_eq!(
+		exchange["client_assertion_type"],
+		CLIENT_ASSERTION_TYPE_JWT_BEARER
+	);
+	verify_assertion(&exchange["client_assertion"], &OTHER_KEY, "app-client").unwrap();
+}
+
+#[rstest]
+// A token well inside its lease serves every signature.
+#[case::reused_while_fresh(3600, 1)]
+// A token inside the refresh margin is never reused: each signature logs in again.
+#[case::renewed_near_expiry(1, 2)]
+#[tokio::test]
+async fn transit_engine_token_is_cached_then_renewed(#[case] lease: u64, #[case] logins: u64) {
+	let engine = mock_engine(
+		engine_login_ok("engine-token-1", lease),
+		logins,
+		&[("app", &OTHER_KEY)],
+	)
+	.await;
+	let idp = mock_idp(self_token_ok()).await;
+	let auth = backend_auth(OAuthTokenExchangeAuth {
+		client_auth: Some(transit_client_auth(
+			transit_signer(&engine, &idp, "app"),
+			"app-client",
+			"app-kid",
+		)),
+		..auth(endpoint(&idp))
+	});
+	// Two callers: two exchanges, two client assertions to sign.
+	for subject in ["subj-a", "subj-b"] {
+		crate::http::auth::apply_backend_auth(
+			&backend_info(),
+			&auth,
+			&mut request_with_subject(subject),
+		)
+		.await
+		.unwrap();
+	}
+	assert_eq!(
+		bodies_sent_to(&engine, "/v1/transit/sign/app").await.len(),
+		2
+	);
+}
+
+#[tokio::test]
+async fn transit_refused_engine_token_logs_in_again_once() {
+	let engine = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/v1/auth/jwt/login"))
+		.respond_with(engine_login_ok("engine-token-stale", 600))
+		.up_to_n_times(1)
+		.with_priority(1)
+		.mount(&engine)
+		.await;
+	Mock::given(method("POST"))
+		.and(path("/v1/auth/jwt/login"))
+		.respond_with(engine_login_ok("engine-token-fresh", 600))
+		.with_priority(2)
+		.mount(&engine)
+		.await;
+	Mock::given(method("POST"))
+		.and(path("/v1/transit/sign/app"))
+		.and(wiremock::matchers::header(
+			"x-vault-token",
+			"engine-token-stale",
+		))
+		.respond_with(
+			ResponseTemplate::new(403).set_body_json(json!({"errors": ["permission denied"]})),
+		)
+		.mount(&engine)
+		.await;
+	Mock::given(method("POST"))
+		.and(path("/v1/transit/sign/app"))
+		.and(wiremock::matchers::header(
+			"x-vault-token",
+			"engine-token-fresh",
+		))
+		.respond_with(TransitSign(&OTHER_KEY))
+		.mount(&engine)
+		.await;
+	let idp = mock_idp(self_token_ok()).await;
+	let mut signer = transit_signer(&engine, &idp, "app");
+	signer["vaultTransit"]
+		.as_object_mut()
+		.unwrap()
+		.remove("namespace");
+	let a = OAuthTokenExchangeAuth {
+		client_auth: Some(transit_client_auth(signer, "app-client", "app-kid")),
+		..auth(endpoint(&idp))
+	};
+
+	crate::http::auth::apply_backend_auth(
+		&backend_info(),
+		&backend_auth(a),
+		&mut request_with_subject("subj"),
+	)
+	.await
+	.unwrap();
+
+	assert_eq!(bodies_sent_to(&engine, "/v1/auth/jwt/login").await.len(), 2);
+	verify_assertion(
+		&forms_sent_to(&idp, "/token").await[0]["client_assertion"],
+		&OTHER_KEY,
+		"app-client",
+	)
+	.unwrap();
+}
+
+#[rstest]
+// The engine will not sign.
+#[case::sign_fails(
+	ResponseTemplate::new(500),
+	engine_login_ok("engine-token-1", 600),
+	self_token_ok(),
+	1
+)]
+// The engine refuses every token: one fresh login, then refused (no loop).
+#[case::sign_always_refused(
+	ResponseTemplate::new(403),
+	engine_login_ok("engine-token-1", 600),
+	self_token_ok(),
+	2
+)]
+// The engine login is refused.
+#[case::login_refused(ResponseTemplate::new(200), ResponseTemplate::new(400).set_body_json(json!({"errors": ["role not found"]})), self_token_ok(), 1)]
+// The gateway cannot obtain its own token for the login.
+#[case::self_token_fails(
+	ResponseTemplate::new(200),
+	engine_login_ok("engine-token-1", 600),
+	ResponseTemplate::new(500),
+	0
+)]
+#[tokio::test]
+async fn transit_signer_failure_fails_closed(
+	#[case] sign: ResponseTemplate,
+	#[case] login: ResponseTemplate,
+	#[case] self_token: ResponseTemplate,
+	#[case] logins: u64,
+) {
+	let engine = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/v1/auth/jwt/login"))
+		.respond_with(login)
+		.expect(logins)
+		.mount(&engine)
+		.await;
+	Mock::given(method("POST"))
+		.and(path("/v1/transit/sign/actor-notarik"))
+		.respond_with(sign)
+		.mount(&engine)
+		.await;
+	let idp = mock_idp(self_token).await;
+	let a = OAuthTokenExchangeAuth {
+		actor_token: Some(gateway_actor(
+			transit_actor(
+				&idp,
+				transit_client_auth(
+					transit_signer(&engine, &idp, "actor-notarik"),
+					"actor-notarik-user",
+					"actor-notarik-kid",
+				),
+			),
+			OAuthTokenType::AccessToken,
+		)),
+		..auth(endpoint(&idp))
+	};
+	let mut req = request_with_subject("subj");
+
+	let result =
+		crate::http::auth::apply_backend_auth(&backend_info(), &backend_auth(a), &mut req).await;
+
+	assert!(result.is_err());
+	// No assertion was sent anywhere, so nothing was exchanged.
+	assert!(forms_sent_to(&idp, "/actor").await.is_empty());
+	assert!(forms_sent_to(&idp, "/token").await.is_empty());
+}
+
+#[tokio::test]
+async fn transit_signer_per_org_each_actor_signs_with_its_own_key() {
+	let engine = mock_engine(
+		engine_login_ok("engine-token-1", 600),
+		2,
+		&[("actor-a", &ACTOR_KEY), ("actor-b", &OTHER_KEY)],
+	)
+	.await;
+	let idp = mock_idp(self_token_ok()).await;
+	let org_actor = |org: &str, key: &str| ActorTokenRequest {
+		path: format!("/actor-{org}"),
+		..transit_actor(
+			&idp,
+			transit_client_auth(
+				transit_signer(&engine, &idp, key),
+				&format!("{key}-user"),
+				key,
+			),
+		)
+	};
+	for org in ["a", "b"] {
+		Mock::given(method("POST"))
+			.and(path(format!("/actor-{org}")))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(actor_token_body(&format!("actor-token-{org}"), 3600)),
+			)
+			.mount(&idp)
+			.await;
+	}
+	let auth = backend_auth(OAuthTokenExchangeAuth {
+		actor_token: Some(ActorTokenSpec {
+			source: None,
+			token_request: None,
+			token_requests: Some(KeyedActorTokenRequests {
+				key: Arc::new(cel::Expression::new_strict(format!(r#"jwt["{ORG_CLAIM}"]"#)).unwrap()),
+				requests: BTreeMap::from([
+					("org-a".to_string(), org_actor("a", "actor-a")),
+					("org-b".to_string(), org_actor("b", "actor-b")),
+				]),
+			}),
+			token_type: OAuthTokenType::AccessToken,
+			enforce_may_act: false,
+		}),
+		..auth(endpoint(&idp))
+	});
+
+	for (subject, org) in [("alice", "org-a"), ("bob", "org-b")] {
+		crate::http::auth::apply_backend_auth(
+			&backend_info(),
+			&auth,
+			&mut caller(subject, json!({ ORG_CLAIM: org })),
+		)
+		.await
+		.unwrap();
+	}
+
+	let a = forms_sent_to(&idp, "/actor-a").await[0]["assertion"].clone();
+	let b = forms_sent_to(&idp, "/actor-b").await[0]["assertion"].clone();
+	verify_assertion(&a, &ACTOR_KEY, "actor-a-user").unwrap();
+	verify_assertion(&b, &OTHER_KEY, "actor-b-user").unwrap();
+	assert!(verify_assertion(&a, &OTHER_KEY, "actor-a-user").is_err());
+	assert!(verify_assertion(&b, &ACTOR_KEY, "actor-b-user").is_err());
+}
+
+#[rstest]
+#[case::key_and_signer(json!({"signingKey": TEST_EC_PRIVATE_KEY_PEM, "alg": "ES256"}), "exactly one of signing_key or signer")]
+#[case::not_rs256(json!({"alg": "ES256"}), "RS256 only")]
+#[case::certificate(json!({"certificate": TEST_EC_CERT_PEM, "certificateHeader": "x5c"}), "certificate")]
+#[case::empty_key(json!({"signer": {"vaultTransit": {"key": ""}}}), "key must not be empty")]
+#[case::key_version_zero(json!({"signer": {"vaultTransit": {"keyVersion": 0}}}), "keyVersion must be 1 or more")]
+// A shape error is refused by clientAuth's untagged parse, which reports it generically.
+#[case::key_version_unset(json!({"signer": {"vaultTransit": {"keyVersion": null}}}), "did not match any variant")]
+#[case::auth_not_tagged(json!({"signer": {"vaultTransit": {"auth": {"role": "agentgateway"}}}}), "did not match any variant")]
+#[case::key_is_a_path(json!({"signer": {"vaultTransit": {"key": "a/b"}}}), "key must be a key name")]
+#[case::login_by_signer(
+	json!({"signer": {"vaultTransit": {"auth": {"jwt": {"tokenRequest": {"clientAuth": {
+		"signingKey": null, "alg": "RS256",
+		"signer": {"vaultTransit": {"address": "http://127.0.0.1:1", "key": "self", "keyVersion": 1, "auth": {"jwt": {"role": "r", "tokenRequest": {
+			"host": "127.0.0.1:1", "grantType": "clientCredentials",
+			"clientAuth": {"clientId": "c", "clientSecret": "s"}}}}}},
+	}}}}}}}),
+	"must hold its own signingKey"
+)]
+fn transit_signer_validate_load(#[case] patch: serde_json::Value, #[case] expected: &str) {
+	let mut config = json!({
+		"method": "privateKeyJwt",
+		"clientId": "actor-notarik-user",
+		"assertionAudience": "https://issuer.example",
+		"signer": {"vaultTransit": {
+			"address": "http://127.0.0.1:1",
+			"key": "actor-notarik",
+			"keyVersion": 1,
+			"auth": {"jwt": {"role": "agentgateway", "tokenRequest": {
+				"host": "127.0.0.1:1",
+				"grantType": "jwtBearer",
+				"clientAuth": {
+					"method": "privateKeyJwt", "clientId": "gateway-user",
+					"signingKey": TEST_EC_PRIVATE_KEY_PEM, "alg": "ES256",
+					"assertionAudience": "https://issuer.example",
+				},
+			}}},
+		}},
+	});
+	json_patch_merge(&mut config, patch);
+	let err = serde_json::from_value::<OAuthClientAuth>(config).unwrap_err();
+	assert!(err.to_string().contains(expected), "got: {err}");
+}
+
+/// RFC 7386 merge patch, for building config variants.
+fn json_patch_merge(target: &mut serde_json::Value, patch: serde_json::Value) {
+	match (target, patch) {
+		(serde_json::Value::Object(t), serde_json::Value::Object(p)) => {
+			for (k, v) in p {
+				json_patch_merge(t.entry(k).or_insert(serde_json::Value::Null), v);
+			}
+		},
+		(t, p) => *t = p,
+	}
+}
+
+#[tokio::test]
+async fn transit_signer_tokens_never_appear_in_debug_output() {
+	let engine = mock_engine(
+		engine_login_ok("engine-token-secret-1", 600),
+		1,
+		&[("app", &OTHER_KEY)],
+	)
+	.await;
+	let idp = mock_idp(self_token_ok()).await;
+	let a = OAuthTokenExchangeAuth {
+		client_auth: Some(transit_client_auth(
+			transit_signer(&engine, &idp, "app"),
+			"app-client",
+			"app-kid",
+		)),
+		..auth(endpoint(&idp))
+	};
+	let auth = backend_auth(a.clone());
+	crate::http::auth::apply_backend_auth(&backend_info(), &auth, &mut request_with_subject("subj"))
+		.await
+		.unwrap();
+	for debug in [format!("{a:?}"), format!("{auth:?}")] {
+		assert!(!debug.contains("engine-token-secret-1"), "{debug}");
+		assert!(!debug.contains("gateway-self-token"), "{debug}");
+		assert!(!debug.contains("PRIVATE KEY"), "{debug}");
+		assert!(debug.contains("VaultTransitSigner"), "{debug}");
+	}
+}
+
+/// A transit key with two versions: signs with the requested `key_version`, or the
+/// latest when none is named, and says which in the `vault:vN:` prefix.
+struct TransitVersions {
+	versions: [(u32, &'static TransitKey); 2],
+	/// Answer as this version whatever was asked (a mis-behaving engine).
+	claim: Option<u32>,
+}
+
+impl wiremock::Respond for TransitVersions {
+	fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+		let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+		let wanted = body["key_version"]
+			.as_u64()
+			.map(|v| v as u32)
+			.unwrap_or(self.versions[1].0);
+		let (version, key) = *self.versions.iter().find(|(v, _)| *v == wanted).unwrap();
+		let input = BASE64_STANDARD
+			.decode(body["input"].as_str().unwrap())
+			.unwrap();
+		let signature =
+			jsonwebtoken::crypto::sign(&input, &key.encoding, jsonwebtoken::Algorithm::RS256).unwrap();
+		let raw = BASE64_URL_SAFE_NO_PAD.decode(signature).unwrap();
+		ResponseTemplate::new(200).set_body_json(json!({
+			"data": {"signature": format!("vault:v{}:{}", self.claim.unwrap_or(version), BASE64_STANDARD.encode(raw))}
+		}))
+	}
+}
+
+async fn engine_with_versions(claim: Option<u32>) -> MockServer {
+	let engine = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/v1/auth/jwt/login"))
+		.respond_with(engine_login_ok("engine-token-1", 600))
+		.mount(&engine)
+		.await;
+	Mock::given(method("POST"))
+		.and(path("/v1/transit/sign/app"))
+		.respond_with(TransitVersions {
+			versions: [(1, &ACTOR_KEY), (2, &OTHER_KEY)],
+			claim,
+		})
+		.mount(&engine)
+		.await;
+	engine
+}
+
+#[tokio::test]
+async fn transit_signer_signs_with_the_pinned_key_version_not_the_latest() {
+	// The key was rotated to v2; the config (and the IdP's registered kid) still pin v1.
+	let engine = engine_with_versions(None).await;
+	let idp = mock_idp(self_token_ok()).await;
+	let a = OAuthTokenExchangeAuth {
+		client_auth: Some(transit_client_auth(
+			transit_signer(&engine, &idp, "app"),
+			"app-client",
+			"app-kid-v1",
+		)),
+		..auth(endpoint(&idp))
+	};
+
+	crate::http::auth::apply_backend_auth(
+		&backend_info(),
+		&backend_auth(a),
+		&mut request_with_subject("subj"),
+	)
+	.await
+	.unwrap();
+
+	assert_eq!(
+		bodies_sent_to(&engine, "/v1/transit/sign/app").await[0]["key_version"],
+		1
+	);
+	let assertion = &forms_sent_to(&idp, "/token").await[0]["client_assertion"];
+	verify_assertion(assertion, &ACTOR_KEY, "app-client").unwrap();
+	assert!(verify_assertion(assertion, &OTHER_KEY, "app-client").is_err());
+	assert_eq!(
+		jsonwebtoken::decode_header(assertion)
+			.unwrap()
+			.kid
+			.as_deref(),
+		Some("app-kid-v1")
+	);
+}
+
+#[tokio::test]
+async fn transit_signature_from_another_version_is_refused() {
+	// The engine answers with a v2 signature to a v1 request: nothing is sent.
+	let engine = engine_with_versions(Some(2)).await;
+	let idp = mock_idp(self_token_ok()).await;
+	let a = OAuthTokenExchangeAuth {
+		client_auth: Some(transit_client_auth(
+			transit_signer(&engine, &idp, "app"),
+			"app-client",
+			"app-kid-v1",
+		)),
+		..auth(endpoint(&idp))
+	};
+
+	let result = crate::http::auth::apply_backend_auth(
+		&backend_info(),
+		&backend_auth(a),
+		&mut request_with_subject("subj"),
+	)
+	.await;
+
+	assert!(result.is_err());
+	assert!(forms_sent_to(&idp, "/token").await.is_empty());
 }

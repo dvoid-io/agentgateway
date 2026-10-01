@@ -74,6 +74,14 @@ impl InMemoryTokenCache {
 	}
 }
 
+impl InMemoryTokenCache {
+	/// Drop the cached token for `req`, so the next lookup fetches a new one (for
+	/// a credential the server has rejected before its expiry).
+	pub(super) fn invalidate(&self, req: &ExchangeRequest) {
+		self.entries.remove(&TokenCacheKey::from(req));
+	}
+}
+
 impl Default for InMemoryTokenCache {
 	fn default() -> Self {
 		Self::new(DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_TTL)

@@ -4206,8 +4206,26 @@
               "type": "string"
             },
             "signingKey": {
-              "description": "PEM-encoded private signing key (RSA or EC, matching `alg`).",
-              "$ref": "#/$defs/FileOrInline"
+              "description": "PEM-encoded private signing key (RSA or EC, matching `alg`). Exactly one\nof `signingKey` or `signer` must be set.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FileOrInline"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "signer": {
+              "description": "An external signer holds the key instead; the gateway never sees it.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/RawSigner"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "certificate": {
               "description": "PEM-encoded X.509 certificate chain, leaf first. The leaf public key must\ncorrespond to `signing_key` for token endpoints to validate assertions.\nA mismatch or comparison failure is logged and does not prevent loading.",
@@ -4253,10 +4271,106 @@
           "required": [
             "method",
             "clientId",
-            "signingKey",
             "assertionAudience"
           ]
         }
+      ]
+    },
+    "RawSigner": {
+      "description": "`signer`: the key is held outside the gateway.",
+      "type": "object",
+      "properties": {
+        "vaultTransit": {
+          "description": "An OpenBao / HashiCorp Vault transit key.",
+          "$ref": "#/$defs/RawVaultTransitSigner"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "vaultTransit"
+      ]
+    },
+    "RawVaultTransitSigner": {
+      "description": "`signer.vaultTransit`: an OpenBao / Vault transit key signs the assertion.",
+      "type": "object",
+      "properties": {
+        "address": {
+          "description": "Base URL of the engine, e.g. `https://bao.example.com` (https gets backend TLS).",
+          "type": "string"
+        },
+        "namespace": {
+          "description": "`X-Vault-Namespace` for every call, when the key lives in a namespace.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "mount": {
+          "description": "Mount path of the transit engine; defaults to `transit`.",
+          "type": "string",
+          "default": "transit"
+        },
+        "key": {
+          "description": "Name of the transit key. Only RSA keys with `alg: RS256` are supported.",
+          "type": "string"
+        },
+        "keyVersion": {
+          "description": "The key version to sign with, sent as `key_version`. Pinned, never the\nlatest: an IdP that picks the verifying key by `kid` refuses a signature\nfrom any other version, so a rotation must change both together.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "auth": {
+          "description": "How the gateway authenticates to the engine.",
+          "$ref": "#/$defs/RawVaultAuth"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "address",
+        "key",
+        "keyVersion",
+        "auth"
+      ]
+    },
+    "RawVaultAuth": {
+      "description": "The engine auth method; one of its fields must be set.",
+      "type": "object",
+      "properties": {
+        "jwt": {
+          "description": "JWT auth: `POST /v1/auth/{path}/login {role, jwt}`.",
+          "$ref": "#/$defs/RawVaultJwtLogin"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "jwt"
+      ]
+    },
+    "RawVaultJwtLogin": {
+      "description": "A JWT auth login at the engine.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "Mount path of the JWT auth method; defaults to `jwt`.",
+          "type": "string",
+          "default": "jwt"
+        },
+        "role": {
+          "description": "Role to log in as.",
+          "type": "string"
+        },
+        "tokenRequest": {
+          "description": "The gateway's own token, presented as the login `jwt`. Same fields as\n`actorToken.tokenRequest`; its `clientAuth` must hold its own key\n(`signingKey`), never a `signer`.",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "tokenRequest"
       ]
     },
     "CertificateHeader": {
