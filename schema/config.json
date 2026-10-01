@@ -3961,8 +3961,26 @@
       "type": "object",
       "properties": {
         "source": {
-          "description": "Where the actor token is read from in the incoming request. The CEL\n`expression` source is permitted (extraction only). Unlike subject tokens,\nactor tokens have no default source.",
-          "$ref": "#/$defs/AuthorizationLocation"
+          "description": "Where the actor token is read from in the incoming request. The CEL\n`expression` source is permitted (extraction only). Unlike subject tokens,\nactor tokens have no default source: exactly one of `source` or\n`tokenRequest` must be set.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthorizationLocation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tokenRequest": {
+          "description": "The gateway obtains the actor token itself, presenting its own identity to\na token endpoint, so the exchange delegates to the gateway rather than to a\ntoken the caller supplies. The token is cached until shortly before it\nexpires; when it cannot be obtained the exchange fails closed.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActorTokenRequest"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "tokenType": {
           "description": "RFC 8693 actor token type URN; when omitted defaults to access_token and is still sent",
@@ -3975,9 +3993,133 @@
           "default": false
         }
       },
-      "additionalProperties": false,
+      "additionalProperties": false
+    },
+    "ActorTokenRequest": {
+      "description": "A token request the gateway makes for its own actor token.",
+      "type": "object",
+      "properties": {
+        "policies": {
+          "description": "Backend policies used when connecting to the service.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SimpleLocalBackendPolicies"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "path": {
+          "description": "Token endpoint path on the backend; defaults to \"/\".",
+          "type": "string"
+        },
+        "grantType": {
+          "description": "Grant the gateway uses to obtain its actor token.",
+          "$ref": "#/$defs/ActorTokenGrant"
+        },
+        "clientAuth": {
+          "description": "The gateway's own credentials. `jwtBearer` requires the `privateKeyJwt` method.",
+          "$ref": "#/$defs/OAuthClientAuth"
+        },
+        "audiences": {
+          "description": "`audience` parameters for the actor token request.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "scopes": {
+          "description": "`scope` values for the actor token request, sent space-delimited.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "resources": {
+          "description": "`resource` parameters for the actor token request.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "unevaluatedProperties": false,
+      "oneOf": [
+        {
+          "description": "Service reference. Service must be defined in the top level services list.",
+          "type": "object",
+          "properties": {
+            "service": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Name of the target Service, as defined in the top-level `services` list.",
+                  "$ref": "#/$defs/NamespacedHostname"
+                },
+                "port": {
+                  "description": "Port on the target Service to route to.",
+                  "type": "integer",
+                  "format": "uint16",
+                  "minimum": 0,
+                  "maximum": 65535
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "port"
+              ]
+            }
+          },
+          "required": [
+            "service"
+          ]
+        },
+        {
+          "description": "Hostname or IP address",
+          "type": "object",
+          "properties": {
+            "host": {
+              "description": "Hostname or IP address",
+              "type": "string"
+            }
+          },
+          "required": [
+            "host"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "backend": {
+              "description": "Explicit backend reference. Backend must be defined in the top level backends list",
+              "type": "string"
+            }
+          },
+          "required": [
+            "backend"
+          ]
+        }
+      ],
       "required": [
-        "source"
+        "grantType",
+        "clientAuth"
+      ]
+    },
+    "ActorTokenGrant": {
+      "description": "How the gateway authenticates when it requests its own actor token.",
+      "oneOf": [
+        {
+          "description": "RFC 6749 §4.4 client credentials, authenticated with `clientAuth`.",
+          "type": "string",
+          "const": "clientCredentials"
+        },
+        {
+          "description": "RFC 7523 §2.1 JWT bearer: the gateway signs an assertion with the\n`privateKeyJwt` key in `clientAuth` (`iss` = `sub` = `clientId`, `aud` =\n`assertionAudience`) and presents it as the grant. No separate client\nauthentication is sent. This is the shape of a service account signing\nwith its own key, as in the ZITADEL JWT profile.",
+          "type": "string",
+          "const": "jwtBearer"
+        }
       ]
     },
     "OAuthClientAuth": {
