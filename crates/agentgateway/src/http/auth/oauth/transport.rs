@@ -9,14 +9,15 @@ use tracing::{debug, warn};
 use url::form_urlencoded;
 
 use super::{
-	ChainedExchange, ExchangeRequest, OAuthClientAuth, OAuthClientAuthMethod, OAuthGrantType,
-	OAuthTokenExchangeAuth, OAuthTokenType, sign_client_assertion,
+	ActorTokenGrant, ActorTokenRequest, ChainedExchange, ExchangeRequest, OAuthClientAuth,
+	OAuthClientAuthMethod, OAuthGrantType, OAuthTokenExchangeAuth, OAuthTokenType,
+	sign_client_assertion,
 };
 use crate::http::auth::BackendAuthError;
 use crate::http::filters::BackendRequestTimeout;
 use crate::http::oauth::{
-	CLIENT_ASSERTION_TYPE_JWT_BEARER, GRANT_TYPE_JWT_BEARER, GRANT_TYPE_TOKEN_EXCHANGE,
-	encode_client_secret_basic, format_token_endpoint_error_body,
+	CLIENT_ASSERTION_TYPE_JWT_BEARER, GRANT_TYPE_CLIENT_CREDENTIALS, GRANT_TYPE_JWT_BEARER,
+	GRANT_TYPE_TOKEN_EXCHANGE, encode_client_secret_basic, format_token_endpoint_error_body,
 };
 use crate::http::{self, Body};
 use crate::json;
@@ -177,11 +178,32 @@ impl TokenResponse {
 	}
 }
 
+/// The grant a token request carries. Wider than [`OAuthGrantType`], which only
+/// names the grants an exchange may be configured with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TokenGrant {
+	/// RFC 8693; `subject_token` (and any actor) from the [`ExchangeRequest`].
+	TokenExchange,
+	/// RFC 7523; the [`ExchangeRequest`]'s subject token is the `assertion`.
+	JwtBearer,
+	/// RFC 6749 §4.4; the client's own credentials, nothing from the request.
+	ClientCredentials,
+}
+
+impl From<OAuthGrantType> for TokenGrant {
+	fn from(grant: OAuthGrantType) -> Self {
+		match grant {
+			OAuthGrantType::TokenExchange => Self::TokenExchange,
+			OAuthGrantType::JwtBearer => Self::JwtBearer,
+		}
+	}
+}
+
 pub(super) struct TokenRequestSpec<'a> {
 	target: &'a SimpleBackendReference,
 	policies: &'a [BackendTrafficPolicy],
 	path: &'a str,
-	grant_type: OAuthGrantType,
+	grant_type: TokenGrant,
 	client_auth: Option<&'a OAuthClientAuth>,
 	audiences: &'a [String],
 	scopes: &'a [String],
@@ -196,7 +218,7 @@ impl<'a> From<&'a OAuthTokenExchangeAuth> for TokenRequestSpec<'a> {
 			target: auth.target.target.as_ref(),
 			policies: &auth.target.policies,
 			path: &auth.path,
-			grant_type: auth.grant_type,
+			grant_type: auth.grant_type.into(),
 			client_auth: auth.client_auth.as_ref(),
 			audiences: &auth.audiences,
 			scopes: &auth.scopes,
@@ -213,8 +235,33 @@ impl<'a> From<&'a ChainedExchange> for TokenRequestSpec<'a> {
 			target: auth.target.target.as_ref(),
 			policies: &auth.target.policies,
 			path: &auth.path,
-			grant_type: OAuthGrantType::JwtBearer,
+			grant_type: TokenGrant::JwtBearer,
 			client_auth: auth.client_auth.as_ref(),
+			audiences: &auth.audiences,
+			scopes: &auth.scopes,
+			resources: &auth.resources,
+			requested_token_type: None,
+			expected_issued_token_type: None,
+		}
+	}
+}
+
+impl<'a> TokenRequestSpec<'a> {
+	/// The gateway's request for its own actor token. `client_auth` is `None` for
+	/// the JWT bearer grant, where the signed assertion is the credential.
+	pub(super) fn actor(
+		auth: &'a ActorTokenRequest,
+		client_auth: Option<&'a OAuthClientAuth>,
+	) -> Self {
+		Self {
+			target: auth.target.target.as_ref(),
+			policies: &auth.target.policies,
+			path: &auth.path,
+			grant_type: match auth.grant_type {
+				ActorTokenGrant::ClientCredentials => TokenGrant::ClientCredentials,
+				ActorTokenGrant::JwtBearer => TokenGrant::JwtBearer,
+			},
+			client_auth,
 			audiences: &auth.audiences,
 			scopes: &auth.scopes,
 			resources: &auth.resources,
@@ -340,7 +387,7 @@ fn build_token_request_form(
 	let mut ser = form_urlencoded::Serializer::new(String::new());
 	let subject_token = req.subject_token.expose_secret();
 	match spec.grant_type {
-		OAuthGrantType::TokenExchange => {
+		TokenGrant::TokenExchange => {
 			// RFC 8693 sends the incoming credential as subject_token
 			ser
 				.append_pair("grant_type", GRANT_TYPE_TOKEN_EXCHANGE)
@@ -355,11 +402,15 @@ fn build_token_request_form(
 				ser.append_pair("requested_token_type", rtt.as_str());
 			}
 		},
-		OAuthGrantType::JwtBearer => {
+		TokenGrant::JwtBearer => {
 			// RFC 7523 sends the incoming credential as assertion
 			ser
 				.append_pair("grant_type", GRANT_TYPE_JWT_BEARER)
 				.append_pair("assertion", subject_token);
+		},
+		TokenGrant::ClientCredentials => {
+			// RFC 6749 §4.4: the client's own credentials, added below
+			ser.append_pair("grant_type", GRANT_TYPE_CLIENT_CREDENTIALS);
 		},
 	}
 	for audience in spec.audiences {
