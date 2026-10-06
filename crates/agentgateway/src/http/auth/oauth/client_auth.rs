@@ -328,8 +328,15 @@ impl TryFrom<RawPrivateKeyJwt> for PrivateKeyJwt {
 				if raw.certificate.is_some() || raw.certificate_header.is_some() {
 					return Err("oauth private_key_jwt signer does not support certificate headers".into());
 				}
+				let signer: VaultTransitSigner = (*signer.vault_transit).try_into()?;
+				if signer.publishes_kid() && raw.kid.is_some() {
+					return Err(
+						"oauth private_key_jwt: kid must be unset with signer.vaultTransit.publishedPair, which reads it with the key version"
+							.into(),
+					);
+				}
 				return Ok(Self {
-					key: AssertionKey::VaultTransit(Arc::new(signer.vault_transit.try_into()?)),
+					key: AssertionKey::VaultTransit(Arc::new(signer)),
 					alg: raw.alg,
 					kid: raw.kid,
 					x5c: None,
@@ -618,8 +625,9 @@ impl fmt::Debug for AssertionKey {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub(super) struct RawSigner {
-	/// An OpenBao / HashiCorp Vault transit key.
-	vault_transit: RawVaultTransitSigner,
+	/// An OpenBao / HashiCorp Vault transit key. Boxed: it is the largest client
+	/// auth configuration by far, and the others stay small.
+	vault_transit: Box<RawVaultTransitSigner>,
 }
 
 impl PrivateKeyJwt {
@@ -643,21 +651,18 @@ pub(super) async fn sign_client_assertion(
 		},
 		AssertionKey::VaultTransit(signer) => {
 			// The JWS compact form, signed by the engine: the same header and
-			// claims, base64url JSON, as a local key would sign. Only the signing
-			// input is held across the call, and the call is boxed: a remote
-			// signature is a cache-miss path and stays off the request future.
-			let input = {
+			// claims, base64url JSON, as a local key would sign (the header's kid
+			// is the published pair's, when the signer reads one). Only the header
+			// and the encoded claims are held across the call, and the call is
+			// boxed: a remote signature is a cache-miss path and stays off the
+			// request future.
+			let (header, claims) = {
 				let (header, claims) = client_assertion_parts(client_id, private_key)?;
-				format!(
-					"{}.{}",
-					URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header)?),
-					URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?),
-				)
+				(header, URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?))
 			};
-			let signature = Box::pin(signer.sign(client, input.as_bytes()))
+			Box::pin(signer.sign_jws(client, header, claims))
 				.await
-				.context("failed to sign client assertion with the transit key")?;
-			Ok(format!("{input}.{signature}"))
+				.context("failed to sign client assertion with the transit key")
 		},
 	}
 }
