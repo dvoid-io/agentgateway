@@ -4281,7 +4281,7 @@
       "type": "object",
       "properties": {
         "vaultTransit": {
-          "description": "An OpenBao / HashiCorp Vault transit key.",
+          "description": "An OpenBao / HashiCorp Vault transit key. Boxed: it is the largest client\nauth configuration by far, and the others stay small.",
           "$ref": "#/$defs/RawVaultTransitSigner"
         }
       },
@@ -4316,10 +4316,25 @@
           "type": "string"
         },
         "keyVersion": {
-          "description": "The key version to sign with, sent as `key_version`. Pinned, never the\nlatest: an IdP that picks the verifying key by `kid` refuses a signature\nfrom any other version, so a rotation must change both together.",
-          "type": "integer",
+          "description": "The key version to sign with, sent as `key_version`, with `clientAuth.kid`\nnaming it. Pinned, never the latest: an IdP that picks the verifying key by\n`kid` refuses a signature from any other version, so a rotation must change\nboth together. Exactly one of `keyVersion` or `publishedPair` must be set.",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint32",
-          "minimum": 0
+          "minimum": 0,
+          "default": null
+        },
+        "publishedPair": {
+          "description": "Read the version and its `kid` at runtime instead, from a KV v2 secret the\nrotation publishes them to; `clientAuth.kid` must then be unset.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawPublishedPair"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "auth": {
           "description": "How the gateway authenticates to the engine.",
@@ -4330,8 +4345,29 @@
       "required": [
         "address",
         "key",
-        "keyVersion",
         "auth"
+      ]
+    },
+    "RawPublishedPair": {
+      "description": "A KV v2 secret holding the key version to sign with and the `kid` naming it:\n`{\"key_version\": 3, \"key_id\": \"...\"}` (the version as a number or a string of\ndigits). It is read through the same engine login and namespace as the sign\ncalls. A read that fails keeps the last pair read; with none yet, nothing is\nsigned. Nothing is ever signed under a guessed version or `kid`.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "API path of the secret, mount included, e.g. `kv/data/broker/app`.",
+          "type": "string"
+        },
+        "refresh": {
+          "description": "How long a pair is used before the next signature reads it again;\ndefaults to 60s. `0s` reads it for every signature.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path"
       ]
     },
     "RawVaultAuth": {

@@ -3777,8 +3777,12 @@ async fn transit_signer_per_org_each_actor_signs_with_its_own_key() {
 #[case::certificate(json!({"certificate": TEST_EC_CERT_PEM, "certificateHeader": "x5c"}), "certificate")]
 #[case::empty_key(json!({"signer": {"vaultTransit": {"key": ""}}}), "key must not be empty")]
 #[case::key_version_zero(json!({"signer": {"vaultTransit": {"keyVersion": 0}}}), "keyVersion must be 1 or more")]
+#[case::key_version_unset(json!({"signer": {"vaultTransit": {"keyVersion": null}}}), "one of keyVersion or publishedPair must be set")]
+#[case::key_version_and_published(json!({"signer": {"vaultTransit": {"publishedPair": {"path": "kv/data/broker/app"}}}}), "exactly one of keyVersion or publishedPair")]
+#[case::published_with_kid(json!({"kid": "stale-kid", "signer": {"vaultTransit": {"keyVersion": null, "publishedPair": {"path": "kv/data/broker/app"}}}}), "kid must be unset")]
+#[case::published_empty_path(json!({"signer": {"vaultTransit": {"keyVersion": null, "publishedPair": {"path": "/"}}}}), "publishedPair.path must not be empty")]
 // A shape error is refused by clientAuth's untagged parse, which reports it generically.
-#[case::key_version_unset(json!({"signer": {"vaultTransit": {"keyVersion": null}}}), "did not match any variant")]
+#[case::published_bad_refresh(json!({"signer": {"vaultTransit": {"keyVersion": null, "publishedPair": {"path": "kv/data/broker/app", "refresh": "soon"}}}}), "did not match any variant")]
 #[case::auth_not_tagged(json!({"signer": {"vaultTransit": {"auth": {"role": "agentgateway"}}}}), "did not match any variant")]
 #[case::key_is_a_path(json!({"signer": {"vaultTransit": {"key": "a/b"}}}), "key must be a key name")]
 #[case::login_by_signer(
@@ -3963,4 +3967,386 @@ async fn transit_signature_from_another_version_is_refused() {
 
 	assert!(result.is_err());
 	assert!(forms_sent_to(&idp, "/token").await.is_empty());
+}
+
+// ----- the published pair: version and kid read at runtime (signer.vaultTransit.publishedPair) -----
+
+const PAIR_PATH: &str = "/v1/kv/data/broker/app";
+
+/// The KV v2 read of a published pair, as the engine answers it.
+fn pair_ok(version: serde_json::Value, kid: serde_json::Value) -> ResponseTemplate {
+	ResponseTemplate::new(200).set_body_json(json!({
+		"data": {"data": {"key_version": version, "key_id": kid, "kind": "app"}, "metadata": {"version": 7}}
+	}))
+}
+
+/// `transit_signer`, reading its version and kid from `kv/data/broker/app`.
+fn published_signer(
+	engine: &MockServer,
+	idp: &MockServer,
+	refresh: Option<&str>,
+) -> serde_json::Value {
+	let mut signer = transit_signer(engine, idp, "app");
+	let v = signer["vaultTransit"].as_object_mut().unwrap();
+	v.remove("keyVersion");
+	let mut pair = json!({"path": "kv/data/broker/app"});
+	if let Some(r) = refresh {
+		pair["refresh"] = json!(r);
+	}
+	v.insert("publishedPair".into(), pair);
+	signer
+}
+
+/// The exchanging app, its kid left to the published pair.
+fn published_client_auth(signer: serde_json::Value) -> OAuthClientAuth {
+	serde_json::from_value(json!({
+		"method": "privateKeyJwt",
+		"clientId": "app-client",
+		"assertionAudience": "https://issuer.example",
+		"signer": signer,
+	}))
+	.unwrap()
+}
+
+fn published_exchange(
+	engine: &MockServer,
+	idp: &MockServer,
+	refresh: Option<&str>,
+) -> crate::http::auth::BackendAuth {
+	backend_auth(OAuthTokenExchangeAuth {
+		client_auth: Some(published_client_auth(published_signer(
+			engine, idp, refresh,
+		))),
+		..auth(endpoint(idp))
+	})
+}
+
+async fn exchange_as(auth: &crate::http::auth::BackendAuth, subject: &str) -> Result<(), String> {
+	crate::http::auth::apply_backend_auth(&backend_info(), auth, &mut request_with_subject(subject))
+		.await
+		.map(|_| ())
+		.map_err(|e| format!("{e:?}"))
+}
+
+/// The kid and the key a client assertion verifies with (ACTOR_KEY is v1, OTHER_KEY v2).
+fn signed_as(assertion: &str) -> (Option<String>, &'static str) {
+	let kid = jsonwebtoken::decode_header(assertion).unwrap().kid;
+	let v1 = verify_assertion(assertion, &ACTOR_KEY, "app-client").is_ok();
+	let v2 = verify_assertion(assertion, &OTHER_KEY, "app-client").is_ok();
+	(
+		kid,
+		match (v1, v2) {
+			(true, false) => "v1",
+			(false, true) => "v2",
+			_ => "neither",
+		},
+	)
+}
+
+async fn pair_reads(engine: &MockServer) -> Vec<wiremock::Request> {
+	engine
+		.received_requests()
+		.await
+		.unwrap()
+		.into_iter()
+		.filter(|r| r.url.path() == PAIR_PATH)
+		.collect()
+}
+
+#[tokio::test]
+async fn transit_published_pair_names_the_version_and_its_kid() {
+	let engine = engine_with_versions(None).await;
+	Mock::given(method("GET"))
+		.and(path(PAIR_PATH))
+		.and(wiremock::matchers::header("x-vault-namespace", "platform"))
+		.and(wiremock::matchers::header(
+			"x-vault-token",
+			"engine-token-1",
+		))
+		.respond_with(pair_ok(json!(2), json!("app-kid-v2")))
+		.mount(&engine)
+		.await;
+	let idp = mock_idp(self_token_ok()).await;
+
+	exchange_as(&published_exchange(&engine, &idp, None), "subj")
+		.await
+		.unwrap();
+
+	// The version read is the version signed with, and its kid names it.
+	assert_eq!(
+		bodies_sent_to(&engine, "/v1/transit/sign/app").await[0]["key_version"],
+		2
+	);
+	let assertion = &forms_sent_to(&idp, "/token").await[0]["client_assertion"];
+	assert_eq!(signed_as(assertion), (Some("app-kid-v2".to_string()), "v2"));
+	assert_eq!(pair_reads(&engine).await.len(), 1);
+}
+
+#[tokio::test]
+async fn transit_published_pair_is_read_once_per_refresh() {
+	let engine = engine_with_versions(None).await;
+	Mock::given(method("GET"))
+		.and(path(PAIR_PATH))
+		.respond_with(pair_ok(json!("1"), json!("app-kid-v1")))
+		.mount(&engine)
+		.await;
+	let idp = mock_idp(self_token_ok()).await;
+	let auth = published_exchange(&engine, &idp, None);
+
+	// Two callers, two signatures, inside the default 60s refresh: one read.
+	for subject in ["subj-a", "subj-b"] {
+		exchange_as(&auth, subject).await.unwrap();
+	}
+
+	assert_eq!(
+		bodies_sent_to(&engine, "/v1/transit/sign/app").await.len(),
+		2
+	);
+	assert_eq!(pair_reads(&engine).await.len(), 1);
+	for form in forms_sent_to(&idp, "/token").await {
+		assert_eq!(
+			signed_as(&form["client_assertion"]),
+			(Some("app-kid-v1".to_string()), "v1")
+		);
+	}
+}
+
+#[tokio::test]
+async fn transit_published_pair_rotates_without_a_restart() {
+	let engine = engine_with_versions(None).await;
+	Mock::given(method("GET"))
+		.and(path(PAIR_PATH))
+		.respond_with(pair_ok(json!(1), json!("app-kid-v1")))
+		.up_to_n_times(1)
+		.with_priority(1)
+		.mount(&engine)
+		.await;
+	Mock::given(method("GET"))
+		.and(path(PAIR_PATH))
+		.respond_with(pair_ok(json!(2), json!("app-kid-v2")))
+		.with_priority(2)
+		.mount(&engine)
+		.await;
+	let idp = mock_idp(self_token_ok()).await;
+	// One loaded configuration, never reloaded; the pair is read for every signature.
+	let auth = published_exchange(&engine, &idp, Some("0s"));
+
+	for subject in ["subj-a", "subj-b"] {
+		exchange_as(&auth, subject).await.unwrap();
+	}
+
+	let versions: Vec<_> = bodies_sent_to(&engine, "/v1/transit/sign/app")
+		.await
+		.iter()
+		.map(|b| b["key_version"].clone())
+		.collect();
+	assert_eq!(versions, vec![json!(1), json!(2)]);
+	let forms = forms_sent_to(&idp, "/token").await;
+	assert_eq!(
+		signed_as(&forms[0]["client_assertion"]),
+		(Some("app-kid-v1".to_string()), "v1")
+	);
+	assert_eq!(
+		signed_as(&forms[1]["client_assertion"]),
+		(Some("app-kid-v2".to_string()), "v2")
+	);
+}
+
+#[tokio::test]
+async fn transit_published_pair_read_failure_keeps_the_last_good_pair() {
+	let engine = engine_with_versions(None).await;
+	Mock::given(method("GET"))
+		.and(path(PAIR_PATH))
+		.respond_with(pair_ok(json!(1), json!("app-kid-v1")))
+		.up_to_n_times(1)
+		.with_priority(1)
+		.mount(&engine)
+		.await;
+	Mock::given(method("GET"))
+		.and(path(PAIR_PATH))
+		.respond_with(ResponseTemplate::new(500))
+		.with_priority(2)
+		.mount(&engine)
+		.await;
+	let idp = mock_idp(self_token_ok()).await;
+	let auth = published_exchange(&engine, &idp, Some("0s"));
+
+	for subject in ["subj-a", "subj-b", "subj-c"] {
+		exchange_as(&auth, subject).await.unwrap();
+	}
+
+	// Every signature tried to read; the failed reads kept v1 and its kid.
+	assert_eq!(pair_reads(&engine).await.len(), 3);
+	for form in forms_sent_to(&idp, "/token").await {
+		assert_eq!(
+			signed_as(&form["client_assertion"]),
+			(Some("app-kid-v1".to_string()), "v1")
+		);
+	}
+}
+
+#[rstest]
+#[case::not_found(ResponseTemplate::new(404).set_body_json(json!({"errors": []})), 1)]
+#[case::engine_error(ResponseTemplate::new(500), 1)]
+// Refused with a fresh token too: one new login, then nothing signed.
+#[case::always_refused(ResponseTemplate::new(403).set_body_json(json!({"errors": ["permission denied"]})), 2)]
+#[case::version_zero(pair_ok(json!(0), json!("kid")), 1)]
+#[case::version_not_a_number(pair_ok(json!("v2"), json!("kid")), 1)]
+#[case::version_too_big(pair_ok(json!(4294967296u64), json!("kid")), 1)]
+#[case::no_kid(pair_ok(json!(2), json!(null)), 1)]
+#[case::empty_kid(pair_ok(json!(2), json!(" ")), 1)]
+// A Zitadel key id is longer than a JSON number holds exactly: only a string is a kid.
+#[case::numeric_kid(pair_ok(json!(2), json!(123456789012345678u64)), 1)]
+#[case::kv_v1_shape(ResponseTemplate::new(200).set_body_json(json!({"data": {"key_version": 2, "key_id": "kid"}})), 1)]
+#[tokio::test]
+async fn transit_published_pair_unreadable_signs_nothing(
+	#[case] read: ResponseTemplate,
+	#[case] logins: u64,
+) {
+	let engine = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/v1/auth/jwt/login"))
+		.respond_with(engine_login_ok("engine-token-1", 600))
+		.expect(logins)
+		.mount(&engine)
+		.await;
+	Mock::given(method("GET"))
+		.and(path(PAIR_PATH))
+		.respond_with(read)
+		.mount(&engine)
+		.await;
+	Mock::given(method("POST"))
+		.and(path("/v1/transit/sign/app"))
+		.respond_with(TransitSign(&ACTOR_KEY))
+		.expect(0)
+		.mount(&engine)
+		.await;
+	let idp = mock_idp(self_token_ok()).await;
+
+	let result = exchange_as(&published_exchange(&engine, &idp, None), "subj").await;
+
+	assert!(result.is_err());
+	// Never a guessed version or kid: nothing signed, nothing exchanged.
+	assert!(forms_sent_to(&idp, "/token").await.is_empty());
+}
+
+#[tokio::test]
+async fn transit_published_pair_refused_token_logs_in_again_once() {
+	let engine = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/v1/auth/jwt/login"))
+		.respond_with(engine_login_ok("engine-token-stale", 600))
+		.up_to_n_times(1)
+		.with_priority(1)
+		.mount(&engine)
+		.await;
+	Mock::given(method("POST"))
+		.and(path("/v1/auth/jwt/login"))
+		.respond_with(engine_login_ok("engine-token-fresh", 600))
+		.with_priority(2)
+		.mount(&engine)
+		.await;
+	Mock::given(method("GET"))
+		.and(path(PAIR_PATH))
+		.and(wiremock::matchers::header(
+			"x-vault-token",
+			"engine-token-stale",
+		))
+		.respond_with(ResponseTemplate::new(403))
+		.mount(&engine)
+		.await;
+	Mock::given(method("GET"))
+		.and(path(PAIR_PATH))
+		.and(wiremock::matchers::header(
+			"x-vault-token",
+			"engine-token-fresh",
+		))
+		.respond_with(pair_ok(json!(2), json!("app-kid-v2")))
+		.mount(&engine)
+		.await;
+	Mock::given(method("POST"))
+		.and(path("/v1/transit/sign/app"))
+		.respond_with(TransitVersions {
+			versions: [(1, &ACTOR_KEY), (2, &OTHER_KEY)],
+			claim: None,
+		})
+		.mount(&engine)
+		.await;
+	let idp = mock_idp(self_token_ok()).await;
+
+	exchange_as(&published_exchange(&engine, &idp, None), "subj")
+		.await
+		.unwrap();
+
+	assert_eq!(bodies_sent_to(&engine, "/v1/auth/jwt/login").await.len(), 2);
+	assert_eq!(
+		signed_as(&forms_sent_to(&idp, "/token").await[0]["client_assertion"]),
+		(Some("app-kid-v2".to_string()), "v2")
+	);
+}
+
+#[tokio::test]
+async fn transit_published_pair_signed_by_another_version_is_refused() {
+	// The pair says v1; an engine answering with a v2 signature is refused.
+	let engine = engine_with_versions(Some(2)).await;
+	Mock::given(method("GET"))
+		.and(path(PAIR_PATH))
+		.respond_with(pair_ok(json!(1), json!("app-kid-v1")))
+		.mount(&engine)
+		.await;
+	let idp = mock_idp(self_token_ok()).await;
+
+	let result = exchange_as(&published_exchange(&engine, &idp, None), "subj").await;
+
+	assert!(result.is_err());
+	assert!(forms_sent_to(&idp, "/token").await.is_empty());
+}
+
+#[tokio::test]
+async fn transit_published_pair_actor_assertion_carries_the_published_kid() {
+	let engine = mock_engine(
+		engine_login_ok("engine-token-1", 600),
+		1,
+		&[("actor-notarik", &ACTOR_KEY)],
+	)
+	.await;
+	Mock::given(method("GET"))
+		.and(path("/v1/kv/data/broker/actor-notarik"))
+		.respond_with(pair_ok(json!(1), json!("actor-kid-published")))
+		.mount(&engine)
+		.await;
+	let idp = mock_idp(self_token_ok()).await;
+	let mut signer = transit_signer(&engine, &idp, "actor-notarik");
+	let v = signer["vaultTransit"].as_object_mut().unwrap();
+	v.remove("keyVersion");
+	v.insert(
+		"publishedPair".into(),
+		json!({"path": "kv/data/broker/actor-notarik"}),
+	);
+	let client_auth: OAuthClientAuth = serde_json::from_value(json!({
+		"method": "privateKeyJwt",
+		"clientId": "actor-notarik-user",
+		"assertionAudience": "https://issuer.example",
+		"signer": signer,
+	}))
+	.unwrap();
+	let a = OAuthTokenExchangeAuth {
+		actor_token: Some(gateway_actor(
+			transit_actor(&idp, client_auth),
+			OAuthTokenType::AccessToken,
+		)),
+		..auth(endpoint(&idp))
+	};
+
+	exchange_as(&backend_auth(a), "subj").await.unwrap();
+
+	let assertion = forms_sent_to(&idp, "/actor").await[0]["assertion"].clone();
+	verify_assertion(&assertion, &ACTOR_KEY, "actor-notarik-user").unwrap();
+	assert_eq!(
+		jsonwebtoken::decode_header(&assertion)
+			.unwrap()
+			.kid
+			.as_deref(),
+		Some("actor-kid-published")
+	);
 }
