@@ -26,6 +26,7 @@ use crate::{apply, cel, schema_enum};
 mod cache;
 pub(crate) mod client_auth;
 mod cross_app_access;
+mod transit;
 mod transport;
 
 use cache::{InMemoryTokenCache, TokenCacheResult};
@@ -656,7 +657,8 @@ impl ActorTokenRequest {
 						"actor token jwtBearer grant requires a privateKeyJwt key"
 					)));
 				};
-				let assertion = sign_client_assertion(&self.client_auth.client_id, private_key)
+				let assertion = sign_client_assertion(client, &self.client_auth.client_id, private_key)
+					.await
 					.map_err(FetchError::Upstream)?;
 				transport::request_token(
 					client,
