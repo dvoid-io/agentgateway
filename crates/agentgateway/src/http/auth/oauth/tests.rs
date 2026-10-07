@@ -1769,7 +1769,9 @@ fn assert_load_err(auth: OAuthTokenExchangeAuth, expected: &str) {
 	OAuthTokenExchangeAuth {
 		grant_type: OAuthGrantType::JwtBearer,
 		actor_token: Some(ActorTokenSpec {
-			source: AuthorizationLocation::default(),
+			source: Some(AuthorizationLocation::default()),
+			token_request: None,
+			token_requests: None,
 			token_type: OAuthTokenType::default(),
 			enforce_may_act: false,
 		}),
@@ -1780,10 +1782,12 @@ fn assert_load_err(auth: OAuthTokenExchangeAuth, expected: &str) {
 #[case::enforce_may_act_non_jwt_actor_token(
 	OAuthTokenExchangeAuth {
 		actor_token: Some(ActorTokenSpec {
-			source: AuthorizationLocation::Header {
+			source: Some(AuthorizationLocation::Header {
 				name: ::http::HeaderName::from_static("x-actor-token"),
 				prefix: None,
-			},
+			}),
+			token_request: None,
+			token_requests: None,
 			token_type: OAuthTokenType::AccessToken,
 			enforce_may_act: true,
 		}),
@@ -2219,10 +2223,12 @@ async fn sends_actor_token() {
 
 fn actor_token_with_header(enforce_may_act: bool) -> ActorTokenSpec {
 	ActorTokenSpec {
-		source: AuthorizationLocation::Header {
+		source: Some(AuthorizationLocation::Header {
 			name: ::http::HeaderName::from_static("x-actor-token"),
 			prefix: None,
-		},
+		}),
+		token_request: None,
+		token_requests: None,
 		token_type: OAuthTokenType::Jwt,
 		enforce_may_act,
 	}
@@ -2236,7 +2242,9 @@ fn actor_token_does_not_fallback_to_subject_claims() {
 		.extensions_mut()
 		.insert(claims_with_may_act(subject, json!({"sub": "actor-a"})));
 
-	let err = actor_token_from_request(&actor_token_with_header(false), &req, subject).unwrap_err();
+	let spec = actor_token_with_header(false);
+	let err =
+		actor_token_from_request(&spec, spec.source.as_ref().unwrap(), &req, subject).unwrap_err();
 	assert!(matches!(err, ProxyError::InvalidRequest));
 }
 
@@ -2525,10 +2533,12 @@ async fn dispatch_removes_input_token_locations_before_inserting_output() {
 	let mock = mock_token_endpoint(ResponseTemplate::new(200).set_body_json(token_body())).await;
 	let a = OAuthTokenExchangeAuth {
 		actor_token: Some(ActorTokenSpec {
-			source: AuthorizationLocation::Header {
+			source: Some(AuthorizationLocation::Header {
 				name: ::http::HeaderName::from_static("x-actor-token"),
 				prefix: None,
-			},
+			}),
+			token_request: None,
+			token_requests: None,
 			token_type: OAuthTokenType::Jwt,
 			enforce_may_act: false,
 		}),
@@ -2564,4 +2574,663 @@ async fn dispatch_removes_input_token_locations_before_inserting_output() {
 			.unwrap(),
 		"upstream-token"
 	);
+}
+
+// ----- actor token the gateway obtains itself (actorToken.tokenRequest) -----
+
+const GATEWAY_ACTOR_TOKEN: &str = "gateway-actor-token";
+
+fn gateway_private_key_jwt() -> PrivateKeyJwt {
+	PrivateKeyJwt::try_from(RawPrivateKeyJwt {
+		signing_key: SecretString::from(TEST_EC_PRIVATE_KEY_PEM),
+		certificate: None,
+		certificate_header: None,
+		alg: JwtSigningAlg::Es256,
+		kid: Some("gateway-key".into()),
+		assertion_audience: "https://issuer.example".into(),
+	})
+	.unwrap()
+}
+
+fn actor_token_request(
+	endpoint: Arc<SimpleBackendReference>,
+	grant_type: ActorTokenGrant,
+	client_auth: OAuthClientAuth,
+) -> ActorTokenRequest {
+	ActorTokenRequest {
+		target: SimpleBackendReferenceWithPolicies {
+			target: endpoint,
+			policies: vec![],
+		},
+		path: "/actor".into(),
+		grant_type,
+		client_auth,
+		audiences: vec![],
+		scopes: vec!["openid".into()],
+		resources: vec![],
+		cache: actor_token_cache(),
+	}
+}
+
+fn jwt_bearer_actor(endpoint: Arc<SimpleBackendReference>) -> ActorTokenRequest {
+	actor_token_request(
+		endpoint,
+		ActorTokenGrant::JwtBearer,
+		OAuthClientAuth {
+			client_id: "gateway-user".into(),
+			method: OAuthClientAuthMethod::PrivateKeyJwt(gateway_private_key_jwt()),
+		},
+	)
+}
+
+fn gateway_actor(token_request: ActorTokenRequest, token_type: OAuthTokenType) -> ActorTokenSpec {
+	ActorTokenSpec {
+		source: None,
+		token_request: Some(token_request),
+		token_requests: None,
+		token_type,
+		enforce_may_act: false,
+	}
+}
+
+fn actor_token_body(access_token: &str, expires_in: u64) -> serde_json::Value {
+	json!({"access_token": access_token, "token_type": "Bearer", "expires_in": expires_in})
+}
+
+/// One server, two endpoints: `/actor` (the gateway's own token) and `/token`
+/// (the exchange). The expected call counts are verified when the server drops.
+async fn mock_actor_and_exchange(
+	actor: ResponseTemplate,
+	actor_calls: u64,
+	exchange_calls: u64,
+) -> MockServer {
+	let mock = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/actor"))
+		.respond_with(actor)
+		.expect(actor_calls)
+		.mount(&mock)
+		.await;
+	Mock::given(method("POST"))
+		.and(path("/token"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(token_body()))
+		.expect(exchange_calls)
+		.mount(&mock)
+		.await;
+	mock
+}
+
+async fn forms_sent_to(mock: &MockServer, to: &str) -> Vec<HashMap<String, String>> {
+	mock
+		.received_requests()
+		.await
+		.unwrap()
+		.iter()
+		.filter(|r| r.url.path() == to)
+		.map(|r| form_urlencoded::parse(&r.body).into_owned().collect())
+		.collect()
+}
+
+fn backend_auth(a: OAuthTokenExchangeAuth) -> crate::http::auth::BackendAuth {
+	crate::http::auth::BackendAuth::new(crate::http::auth::BackendAuthKind::OAuthTokenExchange(
+		Box::new(a),
+	))
+}
+
+fn request_with_subject(subject: &str) -> crate::http::Request {
+	::http::Request::builder()
+		.method(::http::Method::GET)
+		.uri("http://upstream/")
+		.header(::http::header::AUTHORIZATION, format!("Bearer {subject}"))
+		.body(Body::empty())
+		.unwrap()
+}
+
+#[tokio::test]
+async fn gateway_actor_token_jwt_bearer_is_signed_by_the_gateway_and_sent_as_actor() {
+	let mock = mock_actor_and_exchange(
+		ResponseTemplate::new(200).set_body_json(actor_token_body(GATEWAY_ACTOR_TOKEN, 3600)),
+		1,
+		1,
+	)
+	.await;
+	let a = OAuthTokenExchangeAuth {
+		actor_token: Some(gateway_actor(
+			jwt_bearer_actor(endpoint(&mock)),
+			OAuthTokenType::AccessToken,
+		)),
+		..auth(endpoint(&mock))
+	};
+	let mut req = request_with_subject("subj");
+
+	crate::http::auth::apply_backend_auth(&backend_info(), &backend_auth(a), &mut req)
+		.await
+		.unwrap();
+
+	// The gateway's own token request: RFC 7523 with an assertion it signed.
+	let actor = &forms_sent_to(&mock, "/actor").await[0];
+	assert_eq!(actor["grant_type"], GRANT_TYPE_JWT_BEARER);
+	assert_eq!(actor["scope"], "openid");
+	assert!(!actor.contains_key("client_assertion"));
+	assert!(!actor.contains_key("subject_token"));
+	#[derive(serde::Deserialize)]
+	struct AssertionClaims {
+		iss: String,
+		sub: String,
+		aud: String,
+	}
+	let claims: AssertionClaims = decode_unverified_jwt_claims(&actor["assertion"]).unwrap();
+	assert_eq!(claims.iss, "gateway-user");
+	assert_eq!(claims.sub, "gateway-user");
+	assert_eq!(claims.aud, "https://issuer.example");
+	let header = jsonwebtoken::decode_header(&actor["assertion"]).unwrap();
+	assert_eq!(header.kid.as_deref(), Some("gateway-key"));
+
+	// The exchange: the caller's token as subject, the gateway's as actor.
+	let exchange = &forms_sent_to(&mock, "/token").await[0];
+	assert_eq!(exchange["grant_type"], GRANT_TYPE_TOKEN_EXCHANGE);
+	assert_eq!(exchange["subject_token"], "subj");
+	assert_eq!(exchange["actor_token"], GATEWAY_ACTOR_TOKEN);
+	assert_eq!(exchange["actor_token_type"], TOKEN_TYPE_ACCESS);
+	assert_eq!(
+		req.headers().get(::http::header::AUTHORIZATION).unwrap(),
+		"Bearer upstream-token"
+	);
+}
+
+#[tokio::test]
+async fn gateway_actor_token_client_credentials_authenticates_the_gateway() {
+	let mock = mock_actor_and_exchange(
+		ResponseTemplate::new(200).set_body_json(actor_token_body(GATEWAY_ACTOR_TOKEN, 3600)),
+		1,
+		1,
+	)
+	.await;
+	let token_request = actor_token_request(
+		endpoint(&mock),
+		ActorTokenGrant::ClientCredentials,
+		OAuthClientAuth {
+			client_id: "gateway-client".into(),
+			method: OAuthClientAuthMethod::ClientSecretBasic {
+				client_secret: "gateway-secret".to_string().into(),
+			},
+		},
+	);
+	let a = OAuthTokenExchangeAuth {
+		actor_token: Some(gateway_actor(token_request, OAuthTokenType::AccessToken)),
+		..auth(endpoint(&mock))
+	};
+
+	crate::http::auth::apply_backend_auth(
+		&backend_info(),
+		&backend_auth(a),
+		&mut request_with_subject("subj"),
+	)
+	.await
+	.unwrap();
+
+	let received = mock.received_requests().await.unwrap();
+	let actor_req = received.iter().find(|r| r.url.path() == "/actor").unwrap();
+	assert_eq!(
+		actor_req.headers.get("authorization").unwrap(),
+		&format!(
+			"Basic {}",
+			BASE64_STANDARD.encode("gateway-client:gateway-secret")
+		)
+	);
+	let actor = &forms_sent_to(&mock, "/actor").await[0];
+	assert_eq!(actor["grant_type"], "client_credentials");
+	assert!(!actor.contains_key("assertion"));
+	assert_eq!(
+		forms_sent_to(&mock, "/token").await[0]["actor_token"],
+		GATEWAY_ACTOR_TOKEN
+	);
+}
+
+#[rstest]
+// A fresh token serves every request until shortly before it expires.
+#[case::cached_while_fresh(3600, 1)]
+// A token inside the refresh margin is never reused: each request obtains a new one.
+#[case::refreshed_near_expiry(1, 2)]
+#[tokio::test]
+async fn gateway_actor_token_is_cached_and_refreshed(
+	#[case] expires_in: u64,
+	#[case] expected_actor_calls: u64,
+) {
+	let mock = mock_actor_and_exchange(
+		ResponseTemplate::new(200).set_body_json(actor_token_body(GATEWAY_ACTOR_TOKEN, expires_in)),
+		expected_actor_calls,
+		2,
+	)
+	.await;
+	let auth = backend_auth(OAuthTokenExchangeAuth {
+		actor_token: Some(gateway_actor(
+			jwt_bearer_actor(endpoint(&mock)),
+			OAuthTokenType::AccessToken,
+		)),
+		..auth(endpoint(&mock))
+	});
+
+	// Two callers, so the exchange itself is not a cache hit.
+	for subject in ["subj-a", "subj-b"] {
+		crate::http::auth::apply_backend_auth(
+			&backend_info(),
+			&auth,
+			&mut request_with_subject(subject),
+		)
+		.await
+		.unwrap();
+	}
+	for exchange in forms_sent_to(&mock, "/token").await {
+		assert_eq!(exchange["actor_token"], GATEWAY_ACTOR_TOKEN);
+	}
+}
+
+#[rstest]
+#[case::server_error(ResponseTemplate::new(500))]
+#[case::rejected(ResponseTemplate::new(401).set_body_json(json!({"error": "invalid_client"})))]
+#[case::invalid_grant(ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})))]
+#[case::not_bearer(ResponseTemplate::new(200).set_body_json(json!({"access_token": "x", "token_type": "N_A"})))]
+#[tokio::test]
+async fn gateway_actor_token_failure_fails_closed(#[case] actor_response: ResponseTemplate) {
+	// No exchange is attempted without the actor, and the caller's token is not forwarded.
+	let mock = mock_actor_and_exchange(actor_response, 1, 0).await;
+	let a = OAuthTokenExchangeAuth {
+		actor_token: Some(gateway_actor(
+			jwt_bearer_actor(endpoint(&mock)),
+			OAuthTokenType::AccessToken,
+		)),
+		..auth(endpoint(&mock))
+	};
+	let mut req = request_with_subject("subj");
+
+	let result =
+		crate::http::auth::apply_backend_auth(&backend_info(), &backend_auth(a), &mut req).await;
+
+	assert!(result.is_err());
+	assert!(forms_sent_to(&mock, "/token").await.is_empty());
+}
+
+#[rstest]
+#[case::authorized("gateway-user", true)]
+#[case::not_authorized("someone-else", false)]
+#[tokio::test]
+async fn gateway_actor_token_honors_enforce_may_act(
+	#[case] may_act_sub: &str,
+	#[case] expect_authorized: bool,
+) {
+	let actor_jwt = jwt_with_claims(&json!({"sub": "gateway-user"}));
+	let mock = mock_actor_and_exchange(
+		ResponseTemplate::new(200).set_body_json(actor_token_body(&actor_jwt, 3600)),
+		1,
+		u64::from(expect_authorized),
+	)
+	.await;
+	let mut actor = gateway_actor(jwt_bearer_actor(endpoint(&mock)), OAuthTokenType::Jwt);
+	actor.enforce_may_act = true;
+	let a = OAuthTokenExchangeAuth {
+		actor_token: Some(actor),
+		..auth(endpoint(&mock))
+	};
+	let subject = jwt_with_claims(&json!({"sub": "subject-a"}));
+	let mut req = request_with_subject(&subject);
+	req
+		.extensions_mut()
+		.insert(claims_with_may_act(&subject, json!({"sub": may_act_sub})));
+
+	let result =
+		crate::http::auth::apply_backend_auth(&backend_info(), &backend_auth(a), &mut req).await;
+
+	if expect_authorized {
+		result.unwrap();
+		assert_eq!(
+			forms_sent_to(&mock, "/token").await[0]["actor_token"],
+			actor_jwt
+		);
+	} else {
+		assert!(matches!(
+			result.unwrap_err(),
+			ProxyError::AuthorizationFailed
+		));
+	}
+}
+
+#[tokio::test]
+async fn gateway_actor_token_and_key_never_appear_in_debug_output() {
+	let mock = mock_actor_and_exchange(
+		ResponseTemplate::new(200).set_body_json(actor_token_body(GATEWAY_ACTOR_TOKEN, 3600)),
+		1,
+		1,
+	)
+	.await;
+	let a = OAuthTokenExchangeAuth {
+		actor_token: Some(gateway_actor(
+			jwt_bearer_actor(endpoint(&mock)),
+			OAuthTokenType::AccessToken,
+		)),
+		..auth(endpoint(&mock))
+	};
+	let auth = backend_auth(a.clone());
+	crate::http::auth::apply_backend_auth(&backend_info(), &auth, &mut request_with_subject("subj"))
+		.await
+		.unwrap();
+
+	// After a fetch the token sits in the cache; neither it nor the key may print.
+	for debug in [format!("{a:?}"), format!("{auth:?}")] {
+		assert!(!debug.contains(GATEWAY_ACTOR_TOKEN), "{debug}");
+		assert!(!debug.contains("PRIVATE KEY"), "{debug}");
+		assert!(!debug.contains("MIGHAgEAMBMGByqGSM49"), "{debug}");
+	}
+}
+
+#[rstest]
+#[case::both_sources(
+	|t: ActorTokenRequest| ActorTokenSpec {
+		source: Some(AuthorizationLocation::default()),
+		..gateway_actor(t, OAuthTokenType::AccessToken)
+	},
+	"exactly one of source, tokenRequest or tokenRequests"
+)]
+#[case::no_source(
+	|_t: ActorTokenRequest| ActorTokenSpec {
+		source: None,
+		token_request: None,
+		token_requests: None,
+		token_type: OAuthTokenType::AccessToken,
+		enforce_may_act: false,
+	},
+	"one of source, tokenRequest or tokenRequests must be set"
+)]
+#[case::jwt_bearer_without_private_key(
+	|t: ActorTokenRequest| gateway_actor(
+		ActorTokenRequest {
+			client_auth: OAuthClientAuth {
+				client_id: "gateway-client".into(),
+				method: OAuthClientAuthMethod::ClientSecretBasic {
+					client_secret: "s".to_string().into(),
+				},
+			},
+			..t
+		},
+		OAuthTokenType::AccessToken,
+	),
+	"requires clientAuth method privateKeyJwt"
+)]
+#[case::relative_path(
+	|t: ActorTokenRequest| gateway_actor(
+		ActorTokenRequest { path: "actor".into(), ..t },
+		OAuthTokenType::AccessToken,
+	),
+	"must start with /"
+)]
+fn gateway_actor_token_validate_load(
+	#[case] build: fn(ActorTokenRequest) -> ActorTokenSpec,
+	#[case] expected: &str,
+) {
+	let spec = build(jwt_bearer_actor(Arc::new(SimpleBackendReference::Invalid)));
+	let err = spec.validate_load().unwrap_err();
+	assert!(err.contains(expected), "got: {err}");
+}
+
+#[test]
+fn gateway_actor_token_deserializes_from_local_config() {
+	let a: OAuthTokenExchangeAuth = serde_json::from_value(json!({
+		"host": "issuer.example:443",
+		"path": "/oauth/v2/token",
+		"requestedTokenType": TOKEN_TYPE_JWT,
+		"actorToken": {
+			"tokenRequest": {
+				"host": "issuer.example:443",
+				"path": "/oauth/v2/token",
+				"grantType": "jwtBearer",
+				"clientAuth": {
+					"method": "privateKeyJwt",
+					"clientId": "gateway-user",
+					"signingKey": TEST_EC_PRIVATE_KEY_PEM,
+					"alg": "ES256",
+					"kid": "gateway-key",
+					"assertionAudience": "https://issuer.example",
+				},
+				"scopes": ["openid"],
+			},
+		},
+	}))
+	.unwrap();
+	a.validate_load().unwrap();
+	let actor = a.actor_token.unwrap();
+	assert!(actor.source.is_none());
+	let token_request = actor.token_request.unwrap();
+	assert_eq!(token_request.grant_type, ActorTokenGrant::JwtBearer);
+	assert_eq!(token_request.path, "/oauth/v2/token");
+	assert_eq!(token_request.client_auth.client_id, "gateway-user");
+}
+
+// ----- one actor per key (actorToken.tokenRequests) -----
+
+const ORG_CLAIM: &str = "urn:zitadel:iam:user:resourceowner:id";
+
+fn org_actor(
+	endpoint: Arc<SimpleBackendReference>,
+	path: &str,
+	client_id: &str,
+) -> ActorTokenRequest {
+	ActorTokenRequest {
+		path: path.into(),
+		client_auth: OAuthClientAuth {
+			client_id: client_id.into(),
+			method: OAuthClientAuthMethod::PrivateKeyJwt(gateway_private_key_jwt()),
+		},
+		..jwt_bearer_actor(endpoint)
+	}
+}
+
+fn actor_per_org(endpoint: Arc<SimpleBackendReference>) -> ActorTokenSpec {
+	ActorTokenSpec {
+		source: None,
+		token_request: None,
+		token_requests: Some(KeyedActorTokenRequests {
+			key: Arc::new(cel::Expression::new_strict(format!(r#"jwt["{ORG_CLAIM}"]"#)).unwrap()),
+			requests: BTreeMap::from([
+				(
+					"org-a".to_string(),
+					org_actor(endpoint.clone(), "/actor-a", "actor-a"),
+				),
+				(
+					"org-b".to_string(),
+					org_actor(endpoint, "/actor-b", "actor-b"),
+				),
+			]),
+		}),
+		token_type: OAuthTokenType::AccessToken,
+		enforce_may_act: false,
+	}
+}
+
+/// A caller whose verified JWT carries `claims` (as jwtAuth leaves them).
+fn caller(subject: &str, claims: serde_json::Value) -> crate::http::Request {
+	let serde_json::Value::Object(inner) = claims else {
+		unreachable!()
+	};
+	let mut req = request_with_subject(subject);
+	req.extensions_mut().insert(crate::http::jwt::Claims {
+		inner,
+		jwt: subject.to_string().into(),
+	});
+	req
+}
+
+async fn mock_two_actors(actor_a: u64, actor_b: u64, exchanges: u64) -> MockServer {
+	let mock = MockServer::start().await;
+	for (p, token, calls) in [
+		("/actor-a", "actor-token-org-a", actor_a),
+		("/actor-b", "actor-token-org-b", actor_b),
+	] {
+		Mock::given(method("POST"))
+			.and(path(p))
+			.respond_with(ResponseTemplate::new(200).set_body_json(actor_token_body(token, 3600)))
+			.expect(calls)
+			.mount(&mock)
+			.await;
+	}
+	Mock::given(method("POST"))
+		.and(path("/token"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(token_body()))
+		.expect(exchanges)
+		.mount(&mock)
+		.await;
+	mock
+}
+
+#[tokio::test]
+async fn actor_per_org_each_caller_gets_its_own_orgs_actor_cached_separately() {
+	// Each org's actor is obtained once; org A's token is reused for A after B
+	// was served, and never for B.
+	let mock = mock_two_actors(1, 1, 3).await;
+	let auth = backend_auth(OAuthTokenExchangeAuth {
+		actor_token: Some(actor_per_org(endpoint(&mock))),
+		..auth(endpoint(&mock))
+	});
+
+	for (subject, org) in [("alice", "org-a"), ("bob", "org-b"), ("carol", "org-a")] {
+		crate::http::auth::apply_backend_auth(
+			&backend_info(),
+			&auth,
+			&mut caller(subject, json!({ ORG_CLAIM: org })),
+		)
+		.await
+		.unwrap();
+	}
+
+	let sent: Vec<(String, String)> = forms_sent_to(&mock, "/token")
+		.await
+		.into_iter()
+		.map(|f| (f["subject_token"].clone(), f["actor_token"].clone()))
+		.collect();
+	assert_eq!(
+		sent,
+		vec![
+			("alice".to_string(), "actor-token-org-a".to_string()),
+			("bob".to_string(), "actor-token-org-b".to_string()),
+			("carol".to_string(), "actor-token-org-a".to_string()),
+		]
+	);
+	// Each org's own key signed its own assertion.
+	for (p, client) in [("/actor-a", "actor-a"), ("/actor-b", "actor-b")] {
+		let form = &forms_sent_to(&mock, p).await[0];
+		#[derive(serde::Deserialize)]
+		struct Iss {
+			iss: String,
+		}
+		let claims: Iss = decode_unverified_jwt_claims(&form["assertion"]).unwrap();
+		assert_eq!(claims.iss, client);
+	}
+}
+
+#[rstest]
+// The caller's org has no actor: refused, never sent with another org's.
+#[case::org_without_actor(Some(json!({ ORG_CLAIM: "org-c" })))]
+// The key expression fails (the claim is absent): refused.
+#[case::claim_missing(Some(json!({"sub": "dave"})))]
+// The key is not an org id (a number renders as "42"): it names no actor, refused.
+#[case::claim_not_a_string(Some(json!({ ORG_CLAIM: 42 })))]
+// No verified JWT at all: refused.
+#[case::no_claims(None)]
+#[tokio::test]
+async fn actor_per_org_refuses_a_caller_it_cannot_place(#[case] claims: Option<serde_json::Value>) {
+	let mock = mock_two_actors(0, 0, 0).await;
+	let auth = backend_auth(OAuthTokenExchangeAuth {
+		actor_token: Some(actor_per_org(endpoint(&mock))),
+		..auth(endpoint(&mock))
+	});
+	let mut req = match claims {
+		Some(c) => caller("dave", c),
+		None => request_with_subject("dave"),
+	};
+
+	let result = crate::http::auth::apply_backend_auth(&backend_info(), &auth, &mut req).await;
+
+	assert!(matches!(
+		result.unwrap_err(),
+		ProxyError::AuthorizationFailed
+	));
+	assert!(mock.received_requests().await.unwrap().is_empty());
+	// The caller's own token is not forwarded either.
+	assert_eq!(
+		req.headers().get(::http::header::AUTHORIZATION).unwrap(),
+		"Bearer dave"
+	);
+}
+
+#[rstest]
+#[case::empty_map(
+	|e: Arc<SimpleBackendReference>| ActorTokenSpec {
+		token_requests: Some(KeyedActorTokenRequests {
+			key: Arc::new(cel::Expression::new_strict(r#""org-a""#).unwrap()),
+			requests: BTreeMap::new(),
+		}),
+		..actor_per_org(e)
+	},
+	"at least one actor"
+)]
+#[case::with_single_request_too(
+	|e: Arc<SimpleBackendReference>| ActorTokenSpec {
+		token_request: Some(jwt_bearer_actor(e.clone())),
+		..actor_per_org(e)
+	},
+	"exactly one of source, tokenRequest or tokenRequests"
+)]
+#[case::bad_entry(
+	|e: Arc<SimpleBackendReference>| {
+		let mut spec = actor_per_org(e);
+		let keyed = spec.token_requests.as_mut().unwrap();
+		keyed.requests.get_mut("org-b").unwrap().path = "relative".into();
+		spec
+	},
+	r#"requests["org-b"]"#
+)]
+fn actor_per_org_validate_load(
+	#[case] build: fn(Arc<SimpleBackendReference>) -> ActorTokenSpec,
+	#[case] expected: &str,
+) {
+	let err = build(Arc::new(SimpleBackendReference::Invalid))
+		.validate_load()
+		.unwrap_err();
+	assert!(err.contains(expected), "got: {err}");
+}
+
+#[test]
+fn actor_per_org_deserializes_from_local_config() {
+	let actor = |client: &str| {
+		json!({
+			"host": "issuer.example:443",
+			"path": "/oauth/v2/token",
+			"grantType": "jwtBearer",
+			"clientAuth": {
+				"method": "privateKeyJwt",
+				"clientId": client,
+				"signingKey": TEST_EC_PRIVATE_KEY_PEM,
+				"alg": "ES256",
+				"assertionAudience": "https://issuer.example",
+			},
+			"scopes": ["urn:zitadel:iam:org:project:id:mcp:aud"],
+		})
+	};
+	let a: OAuthTokenExchangeAuth = serde_json::from_value(json!({
+		"host": "issuer.example:443",
+		"path": "/oauth/v2/token",
+		"actorToken": {
+			"tokenRequests": {
+				"key": format!(r#"jwt["{ORG_CLAIM}"]"#),
+				"requests": { "org-a": actor("actor-a"), "org-b": actor("actor-b") },
+			},
+		},
+	}))
+	.unwrap();
+	a.validate_load().unwrap();
+	let keyed = a.actor_token.unwrap().token_requests.unwrap();
+	assert_eq!(
+		keyed.requests.keys().collect::<Vec<_>>(),
+		vec!["org-a", "org-b"]
+	);
+	assert_eq!(keyed.requests["org-b"].client_auth.client_id, "actor-b");
 }
