@@ -1,0 +1,96 @@
+# dvoid (org-specific): build an agentgateway image from THIS fork's
+# deploy/production (= release/v1.5 + patch/* + local/*) and push it to
+# ghcr.io/dvoid-io/agentgateway. platform's services/agentgateway/Dockerfile
+# derives from it. Building from the fork is the point: it carries
+# patch/actor-from-client (the gateway as its own RFC 8693 actor) until
+# upstream ships the equivalent. Uses upstream's Dockerfile unchanged, single
+# linux/amd64 for Railway.
+#
+# The image is built only after the fork's own tests pass: the unit tests of
+# every crate a patch/* or local/* branch changes. Upstream's suite is
+# upstream's to keep green; what only this fork can break is what its
+# branches touch.
+#
+# Lives on local/ci-image-build; reaches deploy/production via rebuild-deploy
+# (estate-ops/docs/UPSTREAM-SYNC.md). Never goes upstream.
+name: dvoid · Build agentgateway image
+
+on:
+  push:
+    branches: [deploy/production]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Upstream's pin (pull_request.yml), not rust-toolchain.toml's floating channel.
+  RUST_VERSION: "1.98.0"
+
+jobs:
+  fork-tests:
+    name: Test the crates the fork changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      # rebuild-deploy builds deploy/production as origin/<base> plus one
+      # `--no-ff` merge per branch titled "merge <branch> into deploy/production",
+      # so the base is the first commit on the first-parent chain without that
+      # title. Everything after it is the fork's.
+      - name: Find the crates the fork changes
+        id: crates
+        run: |
+          set -euo pipefail
+          base="$(git log --first-parent -1 --format=%H --invert-grep \
+            -E --grep='^merge (patch|local)/.+ into deploy/production$' HEAD)"
+          crates="$(git diff --name-only "$base" HEAD -- 'crates/*/src/**' | cut -d/ -f2 | sort -u |
+            while read -r d; do sed -n 's/^name *= *"\(.*\)"/\1/p' "crates/$d/Cargo.toml" | head -1; done | paste -sd' ')"
+          echo "base: $(git log -1 --format='%h %s' "$base")"
+          echo "crates: ${crates:-none}"
+          # A gate that tests nothing must not pass as one: no crate means the
+          # base was not found, or the fork no longer carries Rust changes.
+          [[ -n "$crates" ]] || { echo "::error::no fork crate to test, see above"; exit 1; }
+          echo "args=$(for c in $crates; do printf -- '-p %s ' "$c"; done)" >> "$GITHUB_OUTPUT"
+      - name: Set up Rust build cache
+        uses: ./.github/actions/rust-build-cache
+        with:
+          rust-version: "${{ env.RUST_VERSION }}"
+          cache-key: dvoid-fork-tests
+          save: "true"
+      # --lib: the crates' unit tests (the patches' tests live there); the
+      # integration suites need upstream's validation dependencies.
+      - run: cargo test --lib ${{ steps.crates.outputs.args }}
+
+  build-image:
+    name: Build & push ghcr.io/dvoid-io/agentgateway
+    needs: fork-tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Version stamp
+        id: v
+        run: echo "version=$(git describe --tags --always)-dvoid" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            VERSION=${{ steps.v.outputs.version }}
+            GIT_REVISION=${{ github.sha }}
+          tags: |
+            ghcr.io/dvoid-io/agentgateway:deploy-production
+            ghcr.io/dvoid-io/agentgateway:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
