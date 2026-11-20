@@ -8,6 +8,7 @@ use serde::Deserialize;
 use tracing::debug;
 use url::form_urlencoded;
 
+use super::client_auth::ClientAssertion;
 use super::{
 	ActorTokenGrant, ActorTokenRequest, ChainedExchange, ExchangeRequest, OAuthClientAuth,
 	OAuthClientAuthMethod, OAuthGrantType, OAuthTokenExchangeAuth, OAuthTokenType,
@@ -264,7 +265,7 @@ pub(super) async fn request_token(
 		),
 		_ => None,
 	};
-	let mut req = build_token_request(spec, req, client_assertion.as_deref())?;
+	let mut req = build_token_request(spec, req, client_assertion.as_ref())?;
 	// Default timeout, overridable by backend request-timeout policy
 	req
 		.extensions_mut()
@@ -310,7 +311,7 @@ fn classify_token_endpoint_error(status: StatusCode, body: String) -> FetchError
 fn build_token_request(
 	spec: &TokenRequestSpec<'_>,
 	req: &ExchangeRequest,
-	client_assertion: Option<&str>,
+	client_assertion: Option<&ClientAssertion>,
 ) -> Result<::http::Request<Body>, FetchError> {
 	let form = build_token_request_form(spec, req, client_assertion)?;
 
@@ -338,7 +339,7 @@ struct TokenRequestForm {
 fn build_token_request_form(
 	spec: &TokenRequestSpec<'_>,
 	req: &ExchangeRequest,
-	client_assertion: Option<&str>,
+	client_assertion: Option<&ClientAssertion>,
 ) -> Result<TokenRequestForm, FetchError> {
 	let mut basic_auth = None;
 	let mut ser = form_urlencoded::Serializer::new(String::new());
@@ -402,10 +403,11 @@ fn build_token_request_form(
 					FetchError::Upstream(anyhow!("private_key_jwt client assertion was not signed"))
 				})?;
 				// client_id is OPTIONAL per RFC 7521, but many providers require it
-				// alongside the assertion; include it for interop.
-				ser.append_pair("client_id", &client_auth.client_id);
+				// alongside the assertion; include it for interop. It is the client the
+				// assertion was signed for, which a published pair can name.
+				ser.append_pair("client_id", &assertion.client_id);
 				ser.append_pair("client_assertion_type", CLIENT_ASSERTION_TYPE_JWT_BEARER);
-				ser.append_pair("client_assertion", assertion);
+				ser.append_pair("client_assertion", &assertion.assertion);
 			},
 		}
 	}

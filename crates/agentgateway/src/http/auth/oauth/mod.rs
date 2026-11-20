@@ -659,7 +659,8 @@ impl ActorTokenRequest {
 				};
 				let assertion = sign_client_assertion(client, &self.client_auth.client_id, private_key)
 					.await
-					.map_err(FetchError::Upstream)?;
+					.map_err(FetchError::Upstream)?
+					.assertion;
 				transport::request_token(
 					client,
 					&transport::TokenRequestSpec::actor(self, None),

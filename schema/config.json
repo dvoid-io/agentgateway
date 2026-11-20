@@ -4203,7 +4203,8 @@
           "properties": {
             "clientId": {
               "description": "`client_id` parameter identifying the gateway at the authorization server.",
-              "type": "string"
+              "type": "string",
+              "default": ""
             },
             "signingKey": {
               "description": "PEM-encoded private signing key (RSA or EC, matching `alg`). Exactly one\nof `signingKey` or `signer` must be set.",
@@ -4270,7 +4271,6 @@
           "additionalProperties": false,
           "required": [
             "method",
-            "clientId",
             "assertionAudience"
           ]
         }
@@ -4349,7 +4349,7 @@
       ]
     },
     "RawPublishedPair": {
-      "description": "A KV v2 secret holding the key version to sign with and the `kid` naming it:\n`{\"key_version\": 3, \"key_id\": \"...\"}` (the version as a number or a string of\ndigits). It is read through the same engine login and namespace as the sign\ncalls. A read that fails keeps the last pair read; with none yet, nothing is\nsigned. Nothing is ever signed under a guessed version or `kid`.",
+      "description": "A KV v2 secret holding the key version to sign with and the `kid` naming it:\n`{\"key_version\": 3, \"key_id\": \"...\"}` (the version as a number or a string of\ndigits). With `clientAuth.clientId` unset, the same secret also names the\nclient the key belongs to (`client_id`), read in the same step, so a rotation\nthat moves to a new client changes all three together. It is read through the same engine login and namespace as the sign\ncalls. A read that fails keeps the last pair read; with none yet, nothing is\nsigned. Nothing is ever signed under a guessed version or `kid`.",
       "type": "object",
       "properties": {
         "path": {

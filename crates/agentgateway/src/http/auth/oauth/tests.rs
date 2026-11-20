@@ -801,7 +801,8 @@ async fn private_key_jwt_sets_x5t_s256_header() {
 
 	let assertion = sign_client_assertion(&policy_client(), "gateway-client", &private_key)
 		.await
-		.unwrap();
+		.unwrap()
+		.assertion;
 	let header = jsonwebtoken::decode_header(&assertion).unwrap();
 	assert_eq!(header.x5c, None);
 	assert_eq!(
@@ -827,7 +828,8 @@ async fn private_key_jwt_signs_with_ps256() {
 
 	let assertion = sign_client_assertion(&policy_client(), "gateway-client", &private_key)
 		.await
-		.unwrap();
+		.unwrap()
+		.assertion;
 	assert_eq!(
 		jsonwebtoken::decode_header(&assertion).unwrap().alg,
 		jsonwebtoken::Algorithm::PS256
@@ -3780,6 +3782,8 @@ async fn transit_signer_per_org_each_actor_signs_with_its_own_key() {
 #[case::key_version_unset(json!({"signer": {"vaultTransit": {"keyVersion": null}}}), "one of keyVersion or publishedPair must be set")]
 #[case::key_version_and_published(json!({"signer": {"vaultTransit": {"publishedPair": {"path": "kv/data/broker/app"}}}}), "exactly one of keyVersion or publishedPair")]
 #[case::published_with_kid(json!({"kid": "stale-kid", "signer": {"vaultTransit": {"keyVersion": null, "publishedPair": {"path": "kv/data/broker/app"}}}}), "kid must be unset")]
+#[case::client_id_unset_pinned(json!({"clientId": null}), "clientId must be set unless")]
+#[case::client_id_unset_local(json!({"clientId": null, "signer": null, "signingKey": TEST_EC_PRIVATE_KEY_PEM, "alg": "ES256"}), "clientId must be set unless")]
 #[case::published_empty_path(json!({"signer": {"vaultTransit": {"keyVersion": null, "publishedPair": {"path": "/"}}}}), "publishedPair.path must not be empty")]
 // A shape error is refused by clientAuth's untagged parse, which reports it generically.
 #[case::published_bad_refresh(json!({"signer": {"vaultTransit": {"keyVersion": null, "publishedPair": {"path": "kv/data/broker/app", "refresh": "soon"}}}}), "did not match any variant")]
@@ -3824,7 +3828,11 @@ fn json_patch_merge(target: &mut serde_json::Value, patch: serde_json::Value) {
 	match (target, patch) {
 		(serde_json::Value::Object(t), serde_json::Value::Object(p)) => {
 			for (k, v) in p {
-				json_patch_merge(t.entry(k).or_insert(serde_json::Value::Null), v);
+				if v.is_null() {
+					t.remove(&k);
+				} else {
+					json_patch_merge(t.entry(k).or_insert(serde_json::Value::Null), v);
+				}
 			}
 		},
 		(t, p) => *t = p,
@@ -4080,6 +4088,109 @@ async fn transit_published_pair_names_the_version_and_its_kid() {
 	let assertion = &forms_sent_to(&idp, "/token").await[0]["client_assertion"];
 	assert_eq!(signed_as(assertion), (Some("app-kid-v2".to_string()), "v2"));
 	assert_eq!(pair_reads(&engine).await.len(), 1);
+}
+
+/// The exchanging app, its client id and kid both left to the published pair.
+fn published_exchange_unnamed(
+	engine: &MockServer,
+	idp: &MockServer,
+	refresh: Option<&str>,
+) -> crate::http::auth::BackendAuth {
+	let client_auth = serde_json::from_value(json!({
+		"method": "privateKeyJwt",
+		"assertionAudience": "https://issuer.example",
+		"signer": published_signer(engine, idp, refresh),
+	}))
+	.unwrap();
+	backend_auth(OAuthTokenExchangeAuth {
+		client_auth: Some(client_auth),
+		..auth(endpoint(idp))
+	})
+}
+
+/// A published pair that also names its client.
+fn pair_with_client(version: u32, kid: &str, client_id: &str) -> ResponseTemplate {
+	ResponseTemplate::new(200).set_body_json(json!({
+		"data": {"data": {"key_version": version, "key_id": kid, "client_id": client_id, "kind": "app"}}
+	}))
+}
+
+#[tokio::test]
+async fn transit_published_pair_names_the_client_with_its_key() {
+	let engine = engine_with_versions(None).await;
+	// A rotation to a new app: the client, its version and its kid move together.
+	Mock::given(method("GET"))
+		.and(path(PAIR_PATH))
+		.respond_with(pair_with_client(1, "app-kid-v1", "app-client"))
+		.up_to_n_times(1)
+		.mount(&engine)
+		.await;
+	Mock::given(method("GET"))
+		.and(path(PAIR_PATH))
+		.respond_with(pair_with_client(2, "new-app-kid-v2", "new-app-client"))
+		.mount(&engine)
+		.await;
+	let idp = mock_idp(self_token_ok()).await;
+	let auth = published_exchange_unnamed(&engine, &idp, Some("0s"));
+
+	for subject in ["subj-a", "subj-b"] {
+		exchange_as(&auth, subject).await.unwrap();
+	}
+
+	let forms = forms_sent_to(&idp, "/token").await;
+	assert_eq!(forms.len(), 2);
+	assert_eq!(forms[0]["client_id"], "app-client");
+	verify_assertion(&forms[0]["client_assertion"], &ACTOR_KEY, "app-client").unwrap();
+	assert_eq!(forms[1]["client_id"], "new-app-client");
+	verify_assertion(&forms[1]["client_assertion"], &OTHER_KEY, "new-app-client").unwrap();
+	assert_eq!(
+		jsonwebtoken::decode_header(&forms[1]["client_assertion"])
+			.unwrap()
+			.kid
+			.as_deref(),
+		Some("new-app-kid-v2")
+	);
+}
+
+#[tokio::test]
+async fn transit_published_pair_without_its_client_signs_nothing() {
+	let engine = engine_with_versions(None).await;
+	Mock::given(method("GET"))
+		.and(path(PAIR_PATH))
+		.respond_with(pair_ok(json!(1), json!("app-kid-v1")))
+		.mount(&engine)
+		.await;
+	let idp = mock_idp(self_token_ok()).await;
+
+	let result = exchange_as(&published_exchange_unnamed(&engine, &idp, None), "subj").await;
+
+	assert!(result.is_err());
+	assert!(
+		bodies_sent_to(&engine, "/v1/transit/sign/app")
+			.await
+			.is_empty()
+	);
+	assert!(forms_sent_to(&idp, "/token").await.is_empty());
+}
+
+#[tokio::test]
+async fn transit_published_pair_client_is_ignored_when_configured() {
+	let engine = engine_with_versions(None).await;
+	Mock::given(method("GET"))
+		.and(path(PAIR_PATH))
+		.respond_with(pair_with_client(1, "app-kid-v1", "someone-else"))
+		.mount(&engine)
+		.await;
+	let idp = mock_idp(self_token_ok()).await;
+
+	exchange_as(&published_exchange(&engine, &idp, None), "subj")
+		.await
+		.unwrap();
+
+	// A configured clientId stands: the pair only names the client when asked to.
+	let form = &forms_sent_to(&idp, "/token").await[0];
+	assert_eq!(form["client_id"], "app-client");
+	verify_assertion(&form["client_assertion"], &ACTOR_KEY, "app-client").unwrap();
 }
 
 #[tokio::test]
