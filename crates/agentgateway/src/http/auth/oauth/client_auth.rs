@@ -117,6 +117,8 @@ enum RawOAuthClientAuth {
 	#[serde(rename_all = "camelCase")]
 	PrivateKeyJwt {
 		/// `client_id` parameter identifying the gateway at the authorization server.
+		// Unset: read at runtime from `signer.vaultTransit.publishedPair` (see there).
+		#[serde(default)]
 		client_id: String,
 		/// PEM-encoded private signing key (RSA or EC, matching `alg`). Exactly one
 		/// of `signingKey` or `signer` must be set.
@@ -198,7 +200,7 @@ impl TryFrom<RawOAuthClientAuthConfig> for OAuthClientAuth {
 				kid,
 				assertion_audience,
 			}) => {
-				let private_key_jwt = PrivateKeyJwt::try_from(RawPrivateKeyJwt {
+				let mut private_key_jwt = PrivateKeyJwt::try_from(RawPrivateKeyJwt {
 					signing_key,
 					signer,
 					certificate,
@@ -207,6 +209,9 @@ impl TryFrom<RawOAuthClientAuthConfig> for OAuthClientAuth {
 					kid,
 					assertion_audience,
 				})?;
+				if client_id.is_empty() {
+					private_key_jwt.read_client_id()?;
+				}
 				(
 					client_id,
 					OAuthClientAuthMethod::PrivateKeyJwt(private_key_jwt),
@@ -468,7 +473,9 @@ impl OAuthClientAuth {
 	}
 
 	pub(super) fn validate_load(&self) -> Result<(), String> {
-		if self.client_id.is_empty() {
+		if self.client_id.is_empty()
+			&& !matches!(&self.method, OAuthClientAuthMethod::PrivateKeyJwt(key) if key.publishes_client_id())
+		{
 			return Err("oauth token exchange client_id must not be empty".into());
 		}
 		match &self.method {
@@ -635,19 +642,47 @@ impl PrivateKeyJwt {
 	pub(super) fn is_external(&self) -> bool {
 		matches!(self.key, AssertionKey::VaultTransit(_))
 	}
+
+	/// Whether the client id is read at runtime with the published pair.
+	pub(super) fn publishes_client_id(&self) -> bool {
+		matches!(&self.key, AssertionKey::VaultTransit(signer) if signer.publishes_client_id())
+	}
+
+	/// Read the client id with the published pair (`clientId` unset). Called at
+	/// load, while the signer is not yet shared.
+	fn read_client_id(&mut self) -> Result<(), String> {
+		const UNSET: &str = "oauth private_key_jwt: clientId must be set unless signer.vaultTransit.publishedPair names it";
+		match &mut self.key {
+			AssertionKey::VaultTransit(signer) => Arc::get_mut(signer)
+				.ok_or_else(|| UNSET.to_string())?
+				.read_client_id(),
+			AssertionKey::Local(_) => Err(UNSET.into()),
+		}
+	}
+}
+
+/// A signed client assertion and the client it was signed for: the
+/// configuration's `clientId`, or the one published with the signing pair.
+pub(super) struct ClientAssertion {
+	pub(super) client_id: String,
+	pub(super) assertion: String,
 }
 
 pub(super) async fn sign_client_assertion(
 	client: &PolicyClient,
 	client_id: &str,
 	private_key: &PrivateKeyJwt,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<ClientAssertion> {
 	match &private_key.key {
 		AssertionKey::Local(signing_key) => {
 			let (header, claims) = client_assertion_parts(client_id, private_key)?;
-			signing_key
+			let assertion = signing_key
 				.encode(&header, &claims)
-				.context("failed to sign client assertion")
+				.context("failed to sign client assertion")?;
+			Ok(ClientAssertion {
+				client_id: client_id.to_string(),
+				assertion,
+			})
 		},
 		AssertionKey::VaultTransit(signer) => {
 			// The JWS compact form, signed by the engine: the same header and
@@ -656,13 +691,23 @@ pub(super) async fn sign_client_assertion(
 			// and the encoded claims are held across the call, and the call is
 			// boxed: a remote signature is a cache-miss path and stays off the
 			// request future.
+			// The pair is read first: when it names the client, the claims are
+			// issued for that client, the one its key and kid belong to.
+			let pair = Box::pin(signer.pair(client))
+				.await
+				.context("failed to sign client assertion with the transit key")?;
+			let client_id = pair.client_id().unwrap_or(client_id).to_string();
 			let (header, claims) = {
-				let (header, claims) = client_assertion_parts(client_id, private_key)?;
+				let (header, claims) = client_assertion_parts(&client_id, private_key)?;
 				(header, URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?))
 			};
-			Box::pin(signer.sign_jws(client, header, claims))
+			let assertion = Box::pin(signer.sign_jws(client, pair, header, claims))
 				.await
-				.context("failed to sign client assertion with the transit key")
+				.context("failed to sign client assertion with the transit key")?;
+			Ok(ClientAssertion {
+				client_id,
+				assertion,
+			})
 		},
 	}
 }

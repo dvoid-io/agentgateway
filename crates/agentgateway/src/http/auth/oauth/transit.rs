@@ -72,7 +72,9 @@ pub(super) struct RawVaultTransitSigner {
 
 /// A KV v2 secret holding the key version to sign with and the `kid` naming it:
 /// `{"key_version": 3, "key_id": "..."}` (the version as a number or a string of
-/// digits). It is read through the same engine login and namespace as the sign
+/// digits). With `clientAuth.clientId` unset, the same secret also names the
+/// client the key belongs to (`client_id`), read in the same step, so a rotation
+/// that moves to a new client changes all three together. It is read through the same engine login and namespace as the sign
 /// calls. A read that fails keeps the last pair read; with none yet, nothing is
 /// signed. Nothing is ever signed under a guessed version or `kid`.
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -133,6 +135,8 @@ pub(super) struct VaultTransitSigner {
 	mount: String,
 	key: String,
 	version: VersionSource,
+	/// Whether the published pair also names the client (`clientAuth.clientId` unset).
+	reads_client_id: bool,
 	login_path: String,
 	login_role: String,
 	login_token_request: Box<ActorTokenRequest>,
@@ -148,6 +152,7 @@ impl fmt::Debug for VaultTransitSigner {
 			.field("mount", &self.mount)
 			.field("key", &self.key)
 			.field("version", &self.version)
+			.field("reads_client_id", &self.reads_client_id)
 			.field("login_path", &self.login_path)
 			.field("login_role", &self.login_role)
 			.finish_non_exhaustive()
@@ -221,6 +226,7 @@ impl TryFrom<RawVaultTransitSigner> for VaultTransitSigner {
 			mount: raw.mount.trim_matches('/').to_string(),
 			key: raw.key,
 			version,
+			reads_client_id: false,
 			login_path: raw.auth.jwt.path.trim_matches('/').to_string(),
 			login_role: raw.auth.jwt.role,
 			login_token_request: raw.auth.jwt.token_request,
@@ -259,11 +265,20 @@ struct PublishedPair {
 }
 
 /// The version that signs, and the `kid` naming it at the IdP (`None`: the
-/// configuration's `clientAuth.kid`).
+/// configuration's `clientAuth.kid`), and the client it signs for (`None`: the
+/// configuration's `clientAuth.clientId`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct SigningPair {
+pub(super) struct SigningPair {
 	version: u32,
 	kid: Option<String>,
+	client_id: Option<String>,
+}
+
+impl SigningPair {
+	/// The published client id, when the pair names it.
+	pub(super) fn client_id(&self) -> Option<&str> {
+		self.client_id.as_deref()
+	}
 }
 
 impl VaultTransitSigner {
@@ -271,19 +286,38 @@ impl VaultTransitSigner {
 	pub(super) fn publishes_kid(&self) -> bool {
 		matches!(self.version, VersionSource::Published(_))
 	}
+
+	/// Read the client id with the pair, for a `clientAuth` without `clientId`.
+	/// Only a published pair can name it.
+	pub(super) fn read_client_id(&mut self) -> Result<(), String> {
+		if !self.publishes_kid() {
+			return Err(
+				"oauth private_key_jwt: clientId must be set unless signer.vaultTransit.publishedPair names it"
+					.into(),
+			);
+		}
+		self.reads_client_id = true;
+		Ok(())
+	}
+
+	/// Whether the client id comes from the published pair.
+	pub(super) fn publishes_client_id(&self) -> bool {
+		self.reads_client_id
+	}
 }
 
 impl VaultTransitSigner {
 	/// The JWS compact serialization of `header` and `claims` (base64url JSON),
-	/// RSASSA-PKCS1-v1_5 with SHA-256. With a published pair, the header's `kid`
-	/// is the pair's, read in the same step as the version that signs.
+	/// RSASSA-PKCS1-v1_5 with SHA-256, by `pair` (from [`Self::pair`]). With a
+	/// published pair, the header's `kid` is the pair's, read in the same step as
+	/// the version that signs.
 	pub(super) async fn sign_jws(
 		&self,
 		client: &PolicyClient,
+		pair: SigningPair,
 		mut header: jsonwebtoken::Header,
 		claims: String,
 	) -> anyhow::Result<String> {
-		let pair = self.pair(client).await?;
 		if let Some(kid) = pair.kid {
 			header.kid = Some(kid);
 		}
@@ -295,12 +329,15 @@ impl VaultTransitSigner {
 		Ok(format!("{input}.{signature}"))
 	}
 
-	async fn pair(&self, client: &PolicyClient) -> anyhow::Result<SigningPair> {
+	/// The pair to sign with: pinned, or the published one (read at most once per
+	/// `refresh`, the last good one kept when a read fails).
+	pub(super) async fn pair(&self, client: &PolicyClient) -> anyhow::Result<SigningPair> {
 		let published = match &self.version {
 			VersionSource::Pinned(version) => {
 				return Ok(SigningPair {
 					version: *version,
 					kid: None,
+					client_id: None,
 				});
 			},
 			VersionSource::Published(published) => published,
@@ -318,6 +355,7 @@ impl VaultTransitSigner {
 						key = %self.key,
 						version = pair.version,
 						kid = pair.kid.as_deref().unwrap_or_default(),
+						client_id = pair.client_id.as_deref().unwrap_or_default(),
 						path = %published.path,
 						"transit key: signing with the published version"
 					);
@@ -344,7 +382,7 @@ impl VaultTransitSigner {
 		}
 	}
 
-	/// A KV v2 read of `{key_version, key_id}`.
+	/// A KV v2 read of `{key_version, key_id}`, and `client_id` when it names the client.
 	async fn read_pair(&self, client: &PolicyClient, path: &str) -> anyhow::Result<SigningPair> {
 		let (status, resp) = self
 			.authed(client, ::http::Method::GET, &format!("/v1/{path}"), None)
@@ -364,6 +402,8 @@ impl VaultTransitSigner {
 		struct Published {
 			key_version: serde_json::Value,
 			key_id: serde_json::Value,
+			#[serde(default)]
+			client_id: serde_json::Value,
 		}
 		let limit = http::response_buffer_limit(&resp);
 		let kv: Kv = json::from_body_with_limit(resp.into_body(), limit)
@@ -385,9 +425,15 @@ impl VaultTransitSigner {
 			serde_json::Value::String(s) if !s.trim().is_empty() => s.clone(),
 			_ => bail!("the published pair at {path} has no key_id"),
 		};
+		let client_id = match &kv.data.data.client_id {
+			_ if !self.reads_client_id => None,
+			serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+			_ => bail!("the published pair at {path} has no client_id"),
+		};
 		Ok(SigningPair {
 			version,
 			kid: Some(kid),
+			client_id,
 		})
 	}
 
