@@ -348,10 +348,16 @@ impl OAuthTokenExchangeAuth {
 				debug!(source=?self.subject_token.source, "oauth token exchange subject token missing");
 				ProxyError::InvalidRequest
 			})?;
+		// A gateway-minted actor token is obtained asynchronously by the caller.
 		let actor = self
 			.actor_token
 			.as_ref()
-			.map(|spec| actor_token_from_request(spec, req, &subject_token))
+			.and_then(|spec| {
+				spec
+					.source
+					.as_ref()
+					.map(|source| actor_token_from_request(spec, source, req, &subject_token))
+			})
 			.transpose()?;
 		let extra_params = self.evaluate_additional_params(req).map_err(|e| {
 			debug!("oauth token exchange additional parameter evaluation failed: {e}");
@@ -385,8 +391,8 @@ impl OAuthTokenExchangeAuth {
 		// Replace the original credentials with the backend's.
 		self.subject_token.source.remove(req)?;
 
-		if let Some(actor) = &self.actor_token {
-			actor.source.remove(req)?;
+		if let Some(source) = self.actor_token.as_ref().and_then(|a| a.source.as_ref()) {
+			source.remove(req)?;
 		}
 
 		self.authorization_location.insert(req, access_token)?;
@@ -488,8 +494,23 @@ pub struct TokenSpec {
 pub struct ActorTokenSpec {
 	/// Where the actor token is read from in the incoming request. The CEL
 	/// `expression` source is permitted (extraction only). Unlike subject tokens,
-	/// actor tokens have no default source.
-	source: AuthorizationLocation,
+	/// actor tokens have no default source: exactly one of `source`,
+	/// `tokenRequest` or `tokenRequests` must be set.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	source: Option<AuthorizationLocation>,
+	/// The gateway obtains the actor token itself, presenting its own identity to
+	/// a token endpoint, so the exchange delegates to the gateway rather than to a
+	/// token the caller supplies. The token is cached until shortly before it
+	/// expires; when it cannot be obtained the exchange fails closed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	token_request: Option<ActorTokenRequest>,
+	/// Like `tokenRequest`, with one actor per key: `key` is evaluated against the
+	/// incoming request (for example the caller's tenant claim) and picks the
+	/// request to use. Each actor's token is obtained and cached on its own. A
+	/// request whose key cannot be evaluated, or names no actor, is refused: it is
+	/// never exchanged with another key's actor.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	token_requests: Option<KeyedActorTokenRequests>,
 	/// RFC 8693 actor token type URN; when omitted defaults to access_token and is still sent
 	#[serde(default)]
 	#[cfg_attr(feature = "schema", schemars(with = "String"))]
@@ -501,12 +522,193 @@ pub struct ActorTokenSpec {
 
 impl ActorTokenSpec {
 	fn validate_load(&self) -> Result<(), String> {
+		let set = [
+			self.source.is_some(),
+			self.token_request.is_some(),
+			self.token_requests.is_some(),
+		];
+		match set.iter().filter(|s| **s).count() {
+			0 => {
+				return Err("actor_token: one of source, tokenRequest or tokenRequests must be set".into());
+			},
+			1 => {},
+			_ => {
+				return Err("actor_token: set exactly one of source, tokenRequest or tokenRequests".into());
+			},
+		}
+		if let Some(token_request) = &self.token_request {
+			token_request.validate_load()?;
+		}
+		if let Some(keyed) = &self.token_requests {
+			keyed.validate_load()?;
+		}
 		if self.enforce_may_act && self.token_type != OAuthTokenType::Jwt {
 			return Err(format!(
 				"actor_token.enforce_may_act requires actor_token.token_type {TOKEN_TYPE_JWT}"
 			));
 		}
 		Ok(())
+	}
+}
+
+/// How the gateway authenticates when it requests its own actor token.
+#[apply(schema_enum!)]
+pub enum ActorTokenGrant {
+	/// RFC 6749 §4.4 client credentials, authenticated with `clientAuth`.
+	ClientCredentials,
+	/// RFC 7523 §2.1 JWT bearer: the gateway signs an assertion with the
+	/// `privateKeyJwt` key in `clientAuth` (`iss` = `sub` = `clientId`, `aud` =
+	/// `assertionAudience`) and presents it as the grant. No separate client
+	/// authentication is sent. This is the shape of a service account signing
+	/// with its own key, as in the ZITADEL JWT profile.
+	JwtBearer,
+}
+
+/// A token request the gateway makes for its own actor token.
+#[apply(schema!)]
+pub struct ActorTokenRequest {
+	/// Backend serving the token endpoint and policies used when connecting to it.
+	#[serde(flatten)]
+	target: SimpleBackendReferenceWithPolicies,
+	/// Token endpoint path on the backend; defaults to "/".
+	#[serde(default, skip_serializing_if = "String::is_empty")]
+	path: String,
+	/// Grant the gateway uses to obtain its actor token.
+	grant_type: ActorTokenGrant,
+	/// The gateway's own credentials. `jwtBearer` requires the `privateKeyJwt` method.
+	client_auth: OAuthClientAuth,
+	/// `audience` parameters for the actor token request.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	audiences: Vec<String>,
+	/// `scope` values for the actor token request, sent space-delimited.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	scopes: Vec<String>,
+	/// `resource` parameters for the actor token request.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	resources: Vec<String>,
+
+	// One entry: the actor token does not depend on the request.
+	#[serde(skip, default = "actor_token_cache")]
+	#[cfg_attr(feature = "schema", schemars(skip))]
+	cache: InMemoryTokenCache,
+}
+
+fn actor_token_cache() -> InMemoryTokenCache {
+	InMemoryTokenCache::new(1, cache::DEFAULT_CACHE_TTL)
+}
+
+impl ActorTokenRequest {
+	fn validate_load(&self) -> Result<(), String> {
+		if !self.path.is_empty() && !self.path.starts_with('/') {
+			return Err(format!(
+				"actor_token.tokenRequest.path {:?} must start with /",
+				self.path
+			));
+		}
+		self.client_auth.validate_load()?;
+		if self.grant_type == ActorTokenGrant::JwtBearer
+			&& !matches!(
+				self.client_auth.method,
+				OAuthClientAuthMethod::PrivateKeyJwt(_)
+			) {
+			return Err(
+				"actor_token.tokenRequest grantType jwtBearer requires clientAuth method privateKeyJwt"
+					.into(),
+			);
+		}
+		warn_on_invalid_resources("oauth actor token request", &self.resources);
+		warn_on_invalid_scopes("oauth actor token request scopes", &self.scopes);
+		Ok(())
+	}
+
+	/// The gateway's actor token, from the cache while it is fresh.
+	async fn fetch(&self, client: &PolicyClient) -> Result<SecretString, FetchError> {
+		// A constant key: the token is the same for every request.
+		let key = ExchangeRequest::default();
+		let result = self
+			.cache
+			.get_or_insert_with(&key, || self.fetch_uncached(client))
+			.await?;
+		match &result {
+			TokenCacheResult::Hit(_) => trace!("actor token cache hit"),
+			TokenCacheResult::Miss(_) => trace!("actor token obtained"),
+		}
+		Ok(result.into_token())
+	}
+
+	async fn fetch_uncached(
+		&self,
+		client: &PolicyClient,
+	) -> Result<transport::TokenEndpointResponse, FetchError> {
+		match self.grant_type {
+			ActorTokenGrant::ClientCredentials => {
+				transport::request_token(
+					client,
+					&transport::TokenRequestSpec::actor(self, Some(&self.client_auth)),
+					&ExchangeRequest::default(),
+				)
+				.await
+			},
+			ActorTokenGrant::JwtBearer => {
+				let OAuthClientAuthMethod::PrivateKeyJwt(private_key) = &self.client_auth.method else {
+					// validate_load guarantees privateKeyJwt for jwtBearer.
+					return Err(FetchError::Upstream(anyhow::anyhow!(
+						"actor token jwtBearer grant requires a privateKeyJwt key"
+					)));
+				};
+				let assertion = sign_client_assertion(&self.client_auth.client_id, private_key)
+					.map_err(FetchError::Upstream)?;
+				transport::request_token(
+					client,
+					&transport::TokenRequestSpec::actor(self, None),
+					&ExchangeRequest::jwt_bearer_assertion(assertion.into(), vec![]),
+				)
+				.await
+			},
+		}
+	}
+}
+
+/// Actor token requests chosen per incoming request.
+#[apply(schema!)]
+pub struct KeyedActorTokenRequests {
+	/// CEL expression evaluated against the incoming request (the verified JWT is
+	/// `jwt`). It must evaluate to a string naming an entry in `requests`.
+	key: Arc<cel::Expression>,
+	/// The actor token request for each key. Each is obtained and cached
+	/// separately: one key's token is never used for another key's request.
+	requests: BTreeMap<String, ActorTokenRequest>,
+}
+
+impl KeyedActorTokenRequests {
+	fn validate_load(&self) -> Result<(), String> {
+		if self.requests.is_empty() {
+			return Err("actor_token.tokenRequests.requests must name at least one actor".into());
+		}
+		for (key, request) in &self.requests {
+			request
+				.validate_load()
+				.map_err(|e| format!("actor_token.tokenRequests.requests[{key:?}]: {e}"))?;
+		}
+		Ok(())
+	}
+
+	/// The actor for this request. Refused (never a fallback) when the key cannot
+	/// be evaluated to a string or names no actor.
+	fn select(&self, req: &Request) -> Result<&ActorTokenRequest, ProxyError> {
+		let exec = cel::Executor::new_request(req);
+		let key = exec
+			.eval(&self.key)
+			.ok()
+			.and_then(|value| value.as_str().ok().map(|k| k.into_owned()));
+		let Some(key) = key else {
+			debug!("oauth token exchange actor key did not evaluate to a string");
+			return Err(ProxyError::AuthorizationFailed);
+		};
+		self.requests.get(&key).ok_or_else(|| {
+			debug!(%key, "oauth token exchange has no actor for this key");
+			ProxyError::AuthorizationFailed
+		})
 	}
 }
 
@@ -609,12 +811,16 @@ fn actor_token_from_proto(
 		));
 	}
 	Ok(ActorTokenSpec {
-		source: authorization_location(
+		source: Some(authorization_location(
 			diagnostics,
 			"backendAuth.oauth.actorToken.source",
 			spec.source.as_ref(),
 			AuthorizationLocation::default(),
-		)?,
+		)?),
+		// Local configuration only: a gateway-minted actor token holds the
+		// gateway's own credentials, which xDS does not carry.
+		token_request: None,
+		token_requests: None,
 		token_type: if spec.token_type.is_empty() {
 			OAuthTokenType::default()
 		} else {
@@ -728,7 +934,20 @@ pub(super) async fn apply_token_exchange(
 ) -> Result<bool, ProxyError> {
 	let client = PolicyClient::new(inputs.clone()).with_parent(req);
 
-	let access_token = fetch_token(&client, auth, auth.build_exchange_request(req)?)
+	let mut exchange = auth.build_exchange_request(req)?;
+	if let Some(spec) = &auth.actor_token
+		&& let Some(token_request) = gateway_actor_request(spec, req)?
+	{
+		// Fails closed: without the gateway's own token there is no exchange.
+		let token = token_request.fetch(&client).await.map_err(|e| {
+			debug!("oauth token exchange could not obtain the gateway's actor token: {e}");
+			e.into_proxy_error()
+		})?;
+		authorize_gateway_actor(spec, req, &exchange, &token)?;
+		exchange.actor = Some((token, spec.token_type.clone()));
+	}
+
+	let access_token = fetch_token(&client, auth, exchange)
 		.await
 		.map_err(FetchError::into_proxy_error)?;
 
@@ -765,13 +984,46 @@ pub(super) fn extract_subject_token(
 		.map(Cow::into_owned)
 }
 
+/// The token request for the gateway's own actor, if the actor is the gateway's:
+/// the single `tokenRequest`, or the one `tokenRequests` selects for this request.
+fn gateway_actor_request<'a>(
+	spec: &'a ActorTokenSpec,
+	req: &Request,
+) -> Result<Option<&'a ActorTokenRequest>, ProxyError> {
+	match (&spec.token_request, &spec.token_requests) {
+		(Some(token_request), _) => Ok(Some(token_request)),
+		(None, Some(keyed)) => keyed.select(req).map(Some),
+		(None, None) => Ok(None),
+	}
+}
+
+/// `enforceMayAct` for an actor token the gateway obtained itself, the same
+/// check a request-sourced actor gets in [`actor_token_from_request`].
+fn authorize_gateway_actor(
+	spec: &ActorTokenSpec,
+	req: &Request,
+	exchange: &ExchangeRequest,
+	token: &SecretString,
+) -> Result<(), ProxyError> {
+	if spec.enforce_may_act
+		&& !may_act_authorizes(
+			req,
+			exchange.subject_token.expose_secret(),
+			token.expose_secret(),
+		) {
+		debug!("oauth token exchange actor is not authorized by the subject's may_act claim");
+		return Err(ProxyError::AuthorizationFailed);
+	}
+	Ok(())
+}
+
 fn actor_token_from_request(
 	spec: &ActorTokenSpec,
+	source: &AuthorizationLocation,
 	req: &Request,
 	subject_token: &str,
 ) -> Result<(SecretString, OAuthTokenType), ProxyError> {
-	let token = spec
-		.source
+	let token = source
 		.extract(req)
 		.map(|token| token.into_owned())
 		.ok_or_else(|| {
